@@ -1,8 +1,6 @@
 //! Configuration options related to a specific `BuildFile`.
 const std = @import("std");
 
-const Self = @This();
-
 pub const BuildOption = struct {
     name: []const u8,
     value: ?[]const u8 = null,
@@ -16,7 +14,7 @@ pub const BuildOption = struct {
             try allocator.dupe(u8, val)
         else
             null;
-        return BuildOption{
+        return .{
             .name = copy_name,
             .value = copy_value,
         };

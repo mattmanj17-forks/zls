@@ -1,11 +1,13 @@
+//! Implementation of [`textDocument/references`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#textDocument_references)
+
 const std = @import("std");
 const Ast = std.zig.Ast;
-const log = std.log.scoped(.zls_references);
 
 const Server = @import("../Server.zig");
 const DocumentStore = @import("../DocumentStore.zig");
 const Analyser = @import("../analysis.zig");
-const types = @import("../lsp.zig");
+const lsp = @import("lsp");
+const types = lsp.types;
 const offsets = @import("../offsets.zig");
 const ast = @import("../ast.zig");
 const tracy = @import("tracy");
@@ -19,17 +21,17 @@ fn labelReferences(
     const tracy_zone = tracy.trace(@src());
     defer tracy_zone.end();
 
-    std.debug.assert(decl.decl == .label_decl); // use `symbolReferences` instead
+    std.debug.assert(decl.decl == .label); // use `symbolReferences` instead
     const handle = decl.handle;
     const tree = handle.tree;
     const token_tags = tree.tokens.items(.tag);
 
     // Find while / for / block from label -> iterate over children nodes, find break and continues, change their labels if they match.
     // This case can be implemented just by scanning tokens.
-    const first_tok = decl.decl.label_decl.label;
-    const last_tok = ast.lastToken(tree, decl.decl.label_decl.block);
+    const first_tok = decl.decl.label.identifier;
+    const last_tok = ast.lastToken(tree, decl.decl.label.block);
 
-    var locations = std.ArrayListUnmanaged(types.Location){};
+    var locations: std.ArrayListUnmanaged(types.Location) = .empty;
     errdefer locations.deinit(allocator);
 
     if (include_decl) {
@@ -61,9 +63,11 @@ fn labelReferences(
 
 const Builder = struct {
     allocator: std.mem.Allocator,
-    locations: std.ArrayListUnmanaged(types.Location) = .{},
+    locations: std.ArrayListUnmanaged(types.Location) = .empty,
     /// this is the declaration we are searching for
     decl_handle: Analyser.DeclWithHandle,
+    /// Whether the `decl_handle` has been added
+    did_add_decl_handle: bool = false,
     analyser: *Analyser,
     encoding: offsets.Encoding,
 
@@ -77,6 +81,12 @@ const Builder = struct {
     }
 
     fn add(self: *Builder, handle: *DocumentStore.Handle, token_index: Ast.TokenIndex) error{OutOfMemory}!void {
+        if (self.decl_handle.handle == handle and
+            self.decl_handle.nameToken() == token_index)
+        {
+            if (self.did_add_decl_handle) return;
+            self.did_add_decl_handle = true;
+        }
         try self.locations.append(self.allocator, .{
             .uri = handle.uri,
             .range = offsets.tokenToRange(handle.tree, token_index, self.encoding),
@@ -98,35 +108,64 @@ const Builder = struct {
 
         const node_tags = tree.nodes.items(.tag);
         const datas = tree.nodes.items(.data);
-        const token_tags = tree.tokens.items(.tag);
-        const starts = tree.tokens.items(.start);
 
         switch (node_tags[node]) {
             .identifier,
             .test_decl,
-            => {
-                const identifier_token = Analyser.getDeclNameToken(tree, node) orelse return;
-                if (token_tags[identifier_token] != .identifier) return;
+            => |tag| {
+                const name_token = switch (tag) {
+                    .identifier => ast.identifierTokenFromIdentifierNode(tree, node) orelse return,
+                    .test_decl => blk: {
+                        const name_token = ast.testDeclNameToken(tree, node) orelse return;
+                        if (tree.tokens.items(.tag)[name_token] != .identifier) return;
+                        break :blk name_token;
+                    },
+                    else => unreachable,
+                };
+                const name = offsets.identifierTokenToNameSlice(tree, name_token);
 
-                const child = (try builder.analyser.lookupSymbolGlobal(
+                const child = try builder.analyser.lookupSymbolGlobal(
                     handle,
-                    offsets.tokenToSlice(tree, identifier_token),
-                    starts[identifier_token],
-                )) orelse return;
+                    name,
+                    tree.tokens.items(.start)[name_token],
+                ) orelse return;
 
                 if (builder.decl_handle.eql(child)) {
-                    try builder.add(handle, identifier_token);
+                    try builder.add(handle, name_token);
                 }
             },
             .field_access => {
                 const lhs = try builder.analyser.resolveTypeOfNode(.{ .node = datas[node].lhs, .handle = handle }) orelse return;
                 const deref_lhs = try builder.analyser.resolveDerefType(lhs) orelse lhs;
 
-                const symbol = offsets.tokenToSlice(tree, datas[node].rhs);
-                const child = (try deref_lhs.lookupSymbol(builder.analyser, symbol)) orelse return;
+                const symbol = offsets.identifierTokenToNameSlice(tree, datas[node].rhs);
+                const child = try deref_lhs.lookupSymbol(builder.analyser, symbol) orelse return;
 
                 if (builder.decl_handle.eql(child)) {
                     try builder.add(handle, datas[node].rhs);
+                }
+            },
+            .struct_init_one,
+            .struct_init_one_comma,
+            .struct_init,
+            .struct_init_comma,
+            .struct_init_dot,
+            .struct_init_dot_comma,
+            .struct_init_dot_two,
+            .struct_init_dot_two_comma,
+            => {
+                var buffer: [2]Ast.Node.Index = undefined;
+                const struct_init = tree.fullStructInit(&buffer, node).?;
+                for (struct_init.ast.fields) |value_node| { // the node of `value` in `.name = value`
+                    const name_token = tree.firstToken(value_node) - 2; // math our way two token indexes back to get the `name`
+                    const name_loc = offsets.tokenToLoc(tree, name_token);
+                    const name = offsets.locToSlice(tree.source, name_loc);
+
+                    const lookup = try builder.analyser.lookupSymbolFieldInit(handle, name, &.{node}) orelse continue;
+
+                    if (builder.decl_handle.eql(lookup)) {
+                        try builder.add(handle, name_token);
+                    }
                 }
             },
             else => {},
@@ -143,7 +182,7 @@ fn gatherReferences(
     builder: anytype,
     handle_behavior: enum { get, get_or_load },
 ) !void {
-    var dependencies = std.StringArrayHashMapUnmanaged(void){};
+    var dependencies: std.StringArrayHashMapUnmanaged(void) = .empty;
     defer {
         for (dependencies.keys()) |uri| {
             allocator.free(uri);
@@ -157,7 +196,7 @@ fn gatherReferences(
                 continue;
         }
 
-        var handle_dependencies = std.ArrayListUnmanaged([]const u8){};
+        var handle_dependencies: std.ArrayListUnmanaged([]const u8) = .empty;
         defer handle_dependencies.deinit(allocator);
         try analyser.store.collectDependencies(allocator, handle, &handle_dependencies);
 
@@ -184,19 +223,18 @@ fn gatherReferences(
 fn symbolReferences(
     allocator: std.mem.Allocator,
     analyser: *Analyser,
+    request: GeneralReferencesRequest,
     decl_handle: Analyser.DeclWithHandle,
     encoding: offsets.Encoding,
     /// add `decl_handle` as a references
     include_decl: bool,
     /// exclude references from the std library
     skip_std_references: bool,
-    /// search other files for references
-    workspace: bool,
 ) error{OutOfMemory}!std.ArrayListUnmanaged(types.Location) {
     const tracy_zone = tracy.trace(@src());
     defer tracy_zone.end();
 
-    std.debug.assert(decl_handle.decl != .label_decl); // use `labelReferences` instead
+    std.debug.assert(decl_handle.decl != .label); // use `labelReferences` instead
 
     var builder = Builder{
         .allocator = allocator,
@@ -212,21 +250,33 @@ fn symbolReferences(
     switch (decl_handle.decl) {
         .ast_node => {
             try builder.collectReferences(curr_handle, 0);
+
+            const source_index = offsets.tokenToIndex(decl_handle.handle.tree, decl_handle.nameToken());
+            // highlight requests only pertain to the current document, otherwise we can try to narrow things down
+            const workspace = if (request == .highlight) false else blk: {
+                const doc_scope = try curr_handle.getDocumentScope();
+                const scope_index = Analyser.innermostScopeAtIndex(doc_scope, source_index);
+                break :blk switch (doc_scope.getScopeTag(scope_index)) {
+                    .function, .block => false,
+                    .container, .container_usingnamespace => decl_handle.isPublic(),
+                    .other => true,
+                };
+            };
             if (workspace) {
                 try gatherReferences(allocator, analyser, curr_handle, skip_std_references, include_decl, &builder, .get);
             }
         },
-        .pointer_payload,
+        .optional_payload,
         .error_union_payload,
         .error_union_error,
-        .array_payload,
+        .for_loop_payload,
         .assign_destructure,
         .switch_payload,
         => {
             try builder.collectReferences(curr_handle, 0);
         },
-        .param_payload => |payload| try builder.collectReferences(curr_handle, payload.func),
-        .label_decl => unreachable, // handled separately by labelReferences
+        .function_parameter => |payload| try builder.collectReferences(curr_handle, payload.func),
+        .label => unreachable, // handled separately by labelReferences
         .error_token => {},
     }
 
@@ -240,7 +290,7 @@ pub const Callsite = struct {
 
 const CallBuilder = struct {
     allocator: std.mem.Allocator,
-    callsites: std.ArrayListUnmanaged(Callsite) = .{},
+    callsites: std.ArrayListUnmanaged(Callsite) = .empty,
     /// this is the declaration we are searching for
     decl_handle: Analyser.DeclWithHandle,
     analyser: *Analyser,
@@ -275,8 +325,6 @@ const CallBuilder = struct {
 
         const node_tags = tree.nodes.items(.tag);
         const datas = tree.nodes.items(.data);
-        const main_tokens = tree.nodes.items(.main_token);
-        // const token_tags = tree.tokens.items(.tag);
         const starts = tree.tokens.items(.start);
 
         switch (node_tags[node]) {
@@ -296,11 +344,11 @@ const CallBuilder = struct {
 
                 switch (node_tags[called_node]) {
                     .identifier => {
-                        const identifier_token = main_tokens[called_node];
+                        const identifier_token = ast.identifierTokenFromIdentifierNode(tree, called_node) orelse return;
 
                         const child = (try builder.analyser.lookupSymbolGlobal(
                             handle,
-                            offsets.tokenToSlice(tree, identifier_token),
+                            offsets.identifierTokenToNameSlice(tree, identifier_token),
                             starts[identifier_token],
                         )) orelse return;
 
@@ -395,20 +443,21 @@ pub fn referencesHandler(server: *Server, arena: std.mem.Allocator, request: Gen
     defer tracy_zone.end();
 
     const handle = server.document_store.getHandle(request.uri()) orelse return null;
+    if (handle.tree.mode == .zon) return null;
 
     if (request.position().character <= 0) return null;
 
     const source_index = offsets.positionToIndex(handle.tree.source, request.position(), server.offset_encoding);
-    const name_loc = Analyser.identifierLocFromPosition(source_index, handle) orelse return null;
+    const name_loc = Analyser.identifierLocFromIndex(handle.tree, source_index) orelse return null;
     const name = offsets.locToSlice(handle.tree.source, name_loc);
-    const pos_context = try Analyser.getPositionContext(server.allocator, handle.tree.source, source_index, true);
+    const pos_context = try Analyser.getPositionContext(server.allocator, handle.tree, source_index, true);
 
-    var analyser = Analyser.init(server.allocator, &server.document_store, &server.ip, handle);
+    var analyser = server.initAnalyser(handle);
     defer analyser.deinit();
 
     // TODO: Make this work with branching types
     const decl = switch (pos_context) {
-        .var_access => try analyser.getSymbolGlobal(source_index, handle, name),
+        .var_access => try analyser.lookupSymbolGlobal(handle, name, source_index),
         .field_access => |loc| z: {
             const held_loc = offsets.locMerge(loc, name_loc);
             const a = try analyser.getSymbolFieldAccesses(arena, handle, source_index, held_loc, name);
@@ -418,7 +467,8 @@ pub fn referencesHandler(server: *Server, arena: std.mem.Allocator, request: Gen
 
             break :z null;
         },
-        .label => try Analyser.getLabelGlobal(source_index, handle, name),
+        .label_access, .label_decl => try Analyser.lookupLabel(handle, name, source_index),
+        .enum_literal => try analyser.getSymbolEnumLiteral(arena, handle, source_index, name),
         else => null,
     } orelse return null;
 
@@ -427,33 +477,34 @@ pub fn referencesHandler(server: *Server, arena: std.mem.Allocator, request: Gen
         else => true,
     };
 
-    const locations = if (decl.decl == .label_decl)
+    const locations = if (decl.decl == .label)
         try labelReferences(arena, decl, server.offset_encoding, include_decl)
     else
         try symbolReferences(
             arena,
             &analyser,
+            request,
             decl,
             server.offset_encoding,
             include_decl,
             server.config.skip_std_references,
-            request != .highlight, // scan the entire workspace except for highlight
         );
 
     switch (request) {
         .rename => |rename| {
-            var changes = std.StringArrayHashMapUnmanaged(std.ArrayListUnmanaged(types.TextEdit)){};
+            const escaped_rename = try std.fmt.allocPrint(arena, "{}", .{std.zig.fmtId(rename.newName)});
+            var changes: std.StringArrayHashMapUnmanaged(std.ArrayListUnmanaged(types.TextEdit)) = .{};
 
             for (locations.items) |loc| {
-                const gop = try changes.getOrPutValue(arena, loc.uri, .{});
+                const gop = try changes.getOrPutValue(arena, loc.uri, .empty);
                 try gop.value_ptr.append(arena, .{
                     .range = loc.range,
-                    .newText = rename.newName,
+                    .newText = escaped_rename,
                 });
             }
 
             // TODO can we avoid having to move map from `changes` to `new_changes`?
-            var new_changes: types.Map(types.DocumentUri, []const types.TextEdit) = .{};
+            var new_changes: lsp.parser.Map(types.DocumentUri, []const types.TextEdit) = .{};
             try new_changes.map.ensureTotalCapacity(arena, @intCast(changes.count()));
 
             var changes_it = changes.iterator();
@@ -465,7 +516,7 @@ pub fn referencesHandler(server: *Server, arena: std.mem.Allocator, request: Gen
         },
         .references => return .{ .references = locations.items },
         .highlight => {
-            var highlights = try std.ArrayListUnmanaged(types.DocumentHighlight).initCapacity(arena, locations.items.len);
+            var highlights: std.ArrayListUnmanaged(types.DocumentHighlight) = try .initCapacity(arena, locations.items.len);
             const uri = handle.uri;
             for (locations.items) |loc| {
                 if (!std.mem.eql(u8, loc.uri, uri)) continue;

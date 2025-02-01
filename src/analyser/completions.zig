@@ -1,8 +1,9 @@
+//! Completions based on a `InternPool.Index`.
+//! This is not the main implementation of code completions of ZLS!
+
 const std = @import("std");
 const InternPool = @import("InternPool.zig");
-const types = @import("../lsp.zig");
-
-const Ast = std.zig.Ast;
+const types = @import("lsp").types;
 
 /// generates a list of dot completions for the given typed-value in `index`
 /// the given `index` must belong to the given InternPool
@@ -18,7 +19,7 @@ pub fn dotCompletions(
     const ty: InternPool.Index = ip.typeOf(index);
 
     const inner_ty = switch (ip.indexToKey(ty)) {
-        .pointer_type => |pointer_info| if (pointer_info.flags.size == .One) pointer_info.elem_type else ty,
+        .pointer_type => |pointer_info| if (pointer_info.flags.size == .one) pointer_info.elem_type else ty,
         else => ty,
     };
 
@@ -62,7 +63,7 @@ pub fn dotCompletions(
             else => {},
         },
         .pointer_type => |pointer_info| {
-            if (pointer_info.flags.size != .Slice) return;
+            if (pointer_info.flags.size != .slice) return;
 
             const formatted = try std.fmt.allocPrint(arena, "{}", .{inner_ty.fmt(ip)});
             std.debug.assert(std.mem.startsWith(u8, formatted, "[]"));
@@ -213,7 +214,7 @@ pub fn fmtFieldDetail(ip: *InternPool, field: InternPool.Struct.Field) std.fmt.F
 
 test "dotCompletions - primitives" {
     const gpa = std.testing.allocator;
-    var ip = try InternPool.init(gpa);
+    var ip: InternPool = try .init(gpa);
     defer ip.deinit(gpa);
 
     try testCompletion(&ip, .bool_type, &.{});
@@ -225,7 +226,7 @@ test "dotCompletions - primitives" {
 
 test "dotCompletions - optional types" {
     const gpa = std.testing.allocator;
-    var ip = try InternPool.init(gpa);
+    var ip: InternPool = try .init(gpa);
     defer ip.deinit(gpa);
 
     const @"?u32" = try ip.get(gpa, .{ .optional_type = .{ .payload_type = .u32_type } });
@@ -240,7 +241,7 @@ test "dotCompletions - optional types" {
 
 test "dotCompletions - array types" {
     const gpa = std.testing.allocator;
-    var ip = try InternPool.init(gpa);
+    var ip: InternPool = try .init(gpa);
     defer ip.deinit(gpa);
 
     const @"[3]u32" = try ip.get(gpa, .{ .array_type = .{ .child = .u32_type, .len = 3 } });
@@ -264,25 +265,25 @@ test "dotCompletions - array types" {
 
 test "dotCompletions - pointer types" {
     const gpa = std.testing.allocator;
-    var ip = try InternPool.init(gpa);
+    var ip: InternPool = try .init(gpa);
     defer ip.deinit(gpa);
 
     const @"*u32" = try ip.get(gpa, .{ .pointer_type = .{
         .elem_type = .u32_type,
         .flags = .{
-            .size = .One,
+            .size = .one,
         },
     } });
     const @"[]u32" = try ip.get(gpa, .{ .pointer_type = .{
         .elem_type = .u32_type,
         .flags = .{
-            .size = .Slice,
+            .size = .slice,
         },
     } });
     const @"[]const u32" = try ip.get(gpa, .{ .pointer_type = .{
         .elem_type = .u32_type,
         .flags = .{
-            .size = .Slice,
+            .size = .slice,
             .is_const = true,
         },
     } });
@@ -316,26 +317,26 @@ test "dotCompletions - pointer types" {
 
 test "dotCompletions - single pointer indirection" {
     const gpa = std.testing.allocator;
-    var ip = try InternPool.init(gpa);
+    var ip: InternPool = try .init(gpa);
     defer ip.deinit(gpa);
 
     const @"[1]u32" = try ip.get(gpa, .{ .array_type = .{ .child = .u32_type, .len = 1 } });
     const @"*[1]u32" = try ip.get(gpa, .{ .pointer_type = .{
         .elem_type = @"[1]u32",
         .flags = .{
-            .size = .One,
+            .size = .one,
         },
     } });
     const @"**[1]u32" = try ip.get(gpa, .{ .pointer_type = .{
         .elem_type = @"*[1]u32",
         .flags = .{
-            .size = .One,
+            .size = .one,
         },
     } });
     const @"[*][1]u32" = try ip.get(gpa, .{ .pointer_type = .{
         .elem_type = @"[1]u32",
         .flags = .{
-            .size = .Many,
+            .size = .many,
         },
     } });
 
@@ -356,11 +357,11 @@ fn testCompletion(
     expected: []const types.CompletionItem,
 ) !void {
     const gpa = std.testing.allocator;
-    var arena_allocator = std.heap.ArenaAllocator.init(gpa);
+    var arena_allocator: std.heap.ArenaAllocator = .init(gpa);
     defer arena_allocator.deinit();
 
     const arena = arena_allocator.allocator();
-    var completions = std.ArrayListUnmanaged(types.CompletionItem){};
+    var completions: std.ArrayListUnmanaged(types.CompletionItem) = .empty;
 
     try dotCompletions(arena, &completions, ip, index);
 

@@ -1,10 +1,7 @@
 const std = @import("std");
-const types = @import("../lsp.zig");
-const offsets = @import("../offsets.zig");
 
 const InternPool = @import("InternPool.zig");
 const Index = InternPool.Index;
-const Key = InternPool.Key;
 
 pub const ErrorMsg = union(enum) {
     /// zig: expected type '{}', found '{}'
@@ -79,30 +76,30 @@ pub const ErrorMsg = union(enum) {
             ),
             .expected_tag_type => |info| blk: {
                 const expected_tag_str = switch (info.expected_tag) {
-                    .Type => "type",
-                    .Void => "void",
-                    .Bool => "bool",
-                    .NoReturn => "noreturn",
-                    .Int => "integer",
-                    .Float => "float",
-                    .Pointer => "pointer",
-                    .Array => "array",
-                    .Struct => "struct",
-                    .ComptimeFloat => "comptime_float",
-                    .ComptimeInt => "comptime_int",
-                    .Undefined => "undefined",
-                    .Null => "null",
-                    .Optional => "optional",
-                    .ErrorUnion => "error union",
-                    .ErrorSet => "error set",
-                    .Enum => "enum",
-                    .Union => "union",
-                    .Fn => "function",
-                    .Opaque => "opaque",
-                    .Frame => "frame",
-                    .AnyFrame => "anyframe",
-                    .Vector => "vector",
-                    .EnumLiteral => "enum literal",
+                    .type => "type",
+                    .void => "void",
+                    .bool => "bool",
+                    .noreturn => "noreturn",
+                    .int => "integer",
+                    .float => "float",
+                    .pointer => "pointer",
+                    .array => "array",
+                    .@"struct" => "struct",
+                    .comptime_float => "comptime_float",
+                    .comptime_int => "comptime_int",
+                    .undefined => "undefined",
+                    .null => "null",
+                    .optional => "optional",
+                    .error_union => "error union",
+                    .error_set => "error set",
+                    .@"enum" => "enum",
+                    .@"union" => "union",
+                    .@"fn" => "function",
+                    .@"opaque" => "opaque",
+                    .frame => "frame",
+                    .@"anyframe" => "anyframe",
+                    .vector => "vector",
+                    .enum_literal => "enum literal",
                 };
                 break :blk std.fmt.format(
                     writer,

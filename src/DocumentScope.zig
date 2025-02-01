@@ -1,28 +1,28 @@
+//! Stores all Scopes and Declarations/Symbols inside a Zig source file.
+
 const std = @import("std");
 const ast = @import("ast.zig");
 const Ast = std.zig.Ast;
 const tracy = @import("tracy");
 const offsets = @import("offsets.zig");
-const Analyser = @import("analysis.zig");
-const Declaration = Analyser.Declaration;
 
 const DocumentScope = @This();
 
-scopes: std.MultiArrayList(Scope) = .{},
-declarations: std.MultiArrayList(Declaration) = .{},
+scopes: std.MultiArrayList(Scope),
+declarations: std.MultiArrayList(Declaration),
 /// used for looking up a child declaration in a given scope
-declaration_lookup_map: DeclarationLookupMap = .{},
-extra: std.ArrayListUnmanaged(u32) = .{},
+declaration_lookup_map: DeclarationLookupMap,
+extra: std.ArrayListUnmanaged(u32),
 /// All identifier token that are in error sets.
 /// When there are multiple error sets that contain the same error, only one of them is stored.
 /// A token that has a doc comment takes priority.
 /// This means that if there a multiple error sets with the same name, only one of them is included.
-global_error_set: IdentifierSet = .{},
+global_error_set: IdentifierSet,
 /// All identifier token that are in enums.
 /// When there are multiple enums that contain the field name, only one of them is stored.
 /// A token that has a doc comment takes priority.
 /// This means that if there a multiple enums with the same name, only one of them is included.
-global_enum_set: IdentifierSet = .{},
+global_enum_set: IdentifierSet,
 
 /// Stores a set of identifier tokens with unique names
 pub const IdentifierSet = std.ArrayHashMapUnmanaged(Ast.TokenIndex, void, IdentifierTokenContext, true);
@@ -54,7 +54,7 @@ pub const DeclarationLookupMap = std.ArrayHashMapUnmanaged(
 );
 
 pub const DeclarationLookup = struct {
-    pub const Kind = enum { field, other };
+    pub const Kind = enum { field, other, label };
     scope: Scope.Index,
     name: []const u8,
     kind: Kind,
@@ -63,7 +63,7 @@ pub const DeclarationLookup = struct {
 pub const DeclarationLookupContext = struct {
     pub fn hash(self: @This(), s: DeclarationLookup) u32 {
         _ = self;
-        var hasher = std.hash.Wyhash.init(0);
+        var hasher: std.hash.Wyhash = .init(0);
         std.hash.autoHash(&hasher, s.scope);
         hasher.update(s.name);
         std.hash.autoHash(&hasher, s.kind);
@@ -77,8 +77,213 @@ pub const DeclarationLookupContext = struct {
     }
 };
 
+/// Assumes that the `node` is not a container_field of a struct tuple field.
+/// Returns a `.identifier` or `.builtin` token.
+fn getDeclNameToken(tree: Ast, node: Ast.Node.Index) ?Ast.TokenIndex {
+    const tags = tree.nodes.items(.tag);
+    const token_tags = tree.tokens.items(.tag);
+    const main_tokens = tree.nodes.items(.main_token);
+
+    var buffer: [1]Ast.Node.Index = undefined;
+    const token_index = switch (tags[node]) {
+        .local_var_decl,
+        .global_var_decl,
+        .simple_var_decl,
+        .aligned_var_decl,
+        => tree.fullVarDecl(node).?.ast.mut_token + 1,
+        .fn_proto,
+        .fn_proto_multi,
+        .fn_proto_one,
+        .fn_proto_simple,
+        .fn_decl,
+        => tree.fullFnProto(&buffer, node).?.name_token orelse return null,
+
+        .identifier => main_tokens[node],
+        .error_value => main_tokens[node] + 2, // 'error'.<main_token +2>
+        .test_decl => ast.testDeclNameToken(tree, node) orelse return null,
+
+        .container_field,
+        .container_field_init,
+        .container_field_align,
+        => main_tokens[node],
+
+        .root,
+        .container_decl,
+        .container_decl_trailing,
+        .container_decl_arg,
+        .container_decl_arg_trailing,
+        .container_decl_two,
+        .container_decl_two_trailing,
+        .tagged_union,
+        .tagged_union_trailing,
+        .tagged_union_two,
+        .tagged_union_two_trailing,
+        .tagged_union_enum_tag,
+        .tagged_union_enum_tag_trailing,
+        .error_set_decl,
+        .block,
+        .block_semicolon,
+        .block_two,
+        .block_two_semicolon,
+        => return null,
+
+        else => return null,
+    };
+
+    if (token_index >= tree.tokens.len) return null;
+    return switch (token_tags[token_index]) {
+        .identifier, .builtin => token_index,
+        else => null,
+    };
+}
+
+pub const Declaration = union(enum) {
+    /// Index of the ast node.
+    /// Can have one of the following tags:
+    ///   - `.root`
+    ///   - `.container_decl`
+    ///   - `.tagged_union`
+    ///   - `.error_set_decl`
+    ///   - `.container_field`
+    ///   - `.fn_proto`
+    ///   - `.fn_decl`
+    ///   - `.var_decl`
+    ///   - `.block`
+    ast_node: Ast.Node.Index,
+    /// Function parameter
+    function_parameter: Param,
+    /// - `if (condition) |identifier| {}`
+    /// - `while (condition) |identifier| {}`
+    optional_payload: struct {
+        identifier: Ast.TokenIndex,
+        condition: Ast.Node.Index,
+    },
+    /// - `for (condition) |identifier| {}`
+    /// - `for (..., condition, ...) |..., identifier, ...| {}`
+    for_loop_payload: struct {
+        identifier: Ast.TokenIndex,
+        condition: Ast.Node.Index,
+    },
+    /// - `if (condition) |identifier| {} else |_| {}`
+    /// - `while (condition) |identifier| {} else |_| {}`
+    error_union_payload: struct {
+        identifier: Ast.TokenIndex,
+        condition: Ast.Node.Index,
+    },
+    /// - `if (condition) |_| {} else |identifier| {}`
+    /// - `while (condition) |_| {} else |identifier| {}`
+    /// - `condition catch |identifier| {}`
+    /// - `errdefer |identifier| {}` (condition is 0)
+    error_union_error: struct {
+        identifier: Ast.TokenIndex,
+        /// may be 0
+        condition: Ast.Node.Index,
+    },
+    assign_destructure: AssignDestructure,
+    // a switch case capture
+    switch_payload: Switch,
+    label: struct {
+        identifier: Ast.TokenIndex,
+        block: Ast.Node.Index,
+    },
+    /// always an identifier
+    /// used as child declarations of an error set declaration
+    error_token: Ast.TokenIndex,
+
+    pub const Param = struct {
+        param_index: u16,
+        func: Ast.Node.Index,
+
+        pub fn get(self: Param, tree: Ast) ?Ast.full.FnProto.Param {
+            var buffer: [1]Ast.Node.Index = undefined;
+            const func = tree.fullFnProto(&buffer, self.func).?;
+            var param_index: u16 = 0;
+            var it = func.iterate(&tree);
+            while (ast.nextFnParam(&it)) |param| : (param_index += 1) {
+                if (self.param_index == param_index) return param;
+            }
+            return null;
+        }
+    };
+
+    pub const AssignDestructure = struct {
+        /// tag is .assign_destructure
+        node: Ast.Node.Index,
+        index: u32,
+
+        pub fn getVarDeclNode(self: AssignDestructure, tree: Ast) Ast.Node.Index {
+            const data = tree.nodes.items(.data);
+            return tree.extra_data[data[self.node].lhs + 1 ..][self.index];
+        }
+
+        pub fn getFullVarDecl(self: AssignDestructure, tree: Ast) Ast.full.VarDecl {
+            return tree.fullVarDecl(self.getVarDeclNode(tree)).?;
+        }
+    };
+
+    pub const Switch = struct {
+        /// tag is `.@"switch"` or `.switch_comma`
+        node: Ast.Node.Index,
+        /// is guaranteed to have a payload_token
+        case_index: u32,
+
+        pub fn getCase(self: Switch, tree: Ast) Ast.full.SwitchCase {
+            const node_datas = tree.nodes.items(.data);
+            const extra = tree.extraData(node_datas[self.node].rhs, Ast.Node.SubRange);
+            const cases = tree.extra_data[extra.start..extra.end];
+            return tree.fullSwitchCase(cases[self.case_index]).?;
+        }
+    };
+
+    pub const Index = enum(u32) {
+        _,
+
+        pub fn toOptional(index: Index) OptionalIndex {
+            return @enumFromInt(@intFromEnum(index));
+        }
+    };
+
+    pub const OptionalIndex = enum(u32) {
+        none = std.math.maxInt(u32),
+        _,
+
+        pub fn unwrap(index: OptionalIndex) ?Index {
+            if (index == .none) return null;
+            return @enumFromInt(@intFromEnum(index));
+        }
+    };
+
+    pub fn eql(a: Declaration, b: Declaration) bool {
+        return std.meta.eql(a, b);
+    }
+
+    /// Returns a `.identifier` or `.builtin` token.
+    pub fn nameToken(decl: Declaration, tree: Ast) Ast.TokenIndex {
+        return switch (decl) {
+            .ast_node => |n| getDeclNameToken(tree, n).?,
+            .function_parameter => |payload| payload.get(tree).?.name_token.?,
+            .optional_payload => |payload| payload.identifier,
+            .error_union_payload => |payload| payload.identifier,
+            .error_union_error => |payload| payload.identifier,
+            .for_loop_payload => |payload| payload.identifier,
+            .label => |payload| payload.identifier,
+            .error_token => |error_token| error_token,
+            .assign_destructure => |payload| {
+                const var_decl_node = payload.getVarDeclNode(tree);
+                const varDecl = tree.fullVarDecl(var_decl_node).?;
+                return varDecl.ast.mut_token + 1;
+            },
+            .switch_payload => |payload| {
+                const case = payload.getCase(tree);
+                const payload_token = case.payload_token.?;
+                return payload_token + @intFromBool(tree.tokens.items(.tag)[payload_token] == .asterisk);
+            },
+        };
+    }
+};
+
 pub const Scope = struct {
-    pub const Tag = enum {
+    pub const Tag = enum(u3) {
         /// `node_tags[ast_node]` is ContainerDecl or Root or ErrorSetDecl
         container,
         /// index into `DocumentScope.extra`
@@ -142,6 +347,7 @@ pub const Scope = struct {
     child_declarations: ChildDeclarations,
 
     pub const Index = enum(u32) {
+        root,
         _,
 
         pub fn toOptional(index: Index) OptionalIndex {
@@ -166,8 +372,8 @@ const ScopeContext = struct {
     doc_scope: *DocumentScope,
 
     current_scope: Scope.OptionalIndex = .none,
-    child_scopes_scratch: std.ArrayListUnmanaged(Scope.Index) = .{},
-    child_declarations_scratch: std.ArrayListUnmanaged(Declaration.Index) = .{},
+    child_scopes_scratch: std.ArrayListUnmanaged(Scope.Index) = .empty,
+    child_declarations_scratch: std.ArrayListUnmanaged(Declaration.Index) = .empty,
 
     fn deinit(context: *ScopeContext) void {
         context.child_scopes_scratch.deinit(context.allocator);
@@ -184,12 +390,19 @@ const ScopeContext = struct {
 
         fn pushDeclaration(
             pushed: PushedScope,
-            name: []const u8,
+            identifier_token: Ast.TokenIndex,
             declaration: Declaration,
             kind: DeclarationLookup.Kind,
         ) error{OutOfMemory}!void {
+            std.debug.assert((declaration == .label) == (kind == .label));
+            const name = offsets.identifierTokenToNameSlice(pushed.context.tree, identifier_token);
             if (std.mem.eql(u8, name, "_")) return;
             defer std.debug.assert(pushed.context.doc_scope.declarations.len == pushed.context.doc_scope.declaration_lookup_map.count());
+
+            if (@import("builtin").mode == .Debug) {
+                // Check that nameToken works
+                std.debug.assert(identifier_token == declaration.nameToken(pushed.context.tree));
+            }
 
             const context = pushed.context;
             const doc_scope = context.doc_scope;
@@ -280,10 +493,10 @@ const ScopeContext = struct {
             .loc = loc,
             .parent_scope = context.current_scope,
             .child_scopes = .{
-                .small = [_]Scope.OptionalIndex{.none} ** Scope.ChildScopes.small_size,
+                .small = @splat(.none),
             },
             .child_declarations = .{
-                .small = [_]Declaration.OptionalIndex{.none} ** Scope.ChildDeclarations.small_size,
+                .small = @splat(.none),
             },
         });
         const new_scope_index: Scope.Index = @enumFromInt(context.doc_scope.scopes.len - 1);
@@ -335,16 +548,35 @@ pub fn init(allocator: std.mem.Allocator, tree: Ast) error{OutOfMemory}!Document
     const tracy_zone = tracy.trace(@src());
     defer tracy_zone.end();
 
-    var document_scope = DocumentScope{};
+    var document_scope: DocumentScope = .{
+        .scopes = .empty,
+        .declarations = .empty,
+        .declaration_lookup_map = .empty,
+        .extra = .empty,
+        .global_error_set = .empty,
+        .global_enum_set = .empty,
+    };
     errdefer document_scope.deinit(allocator);
 
-    var context = ScopeContext{
+    var context: ScopeContext = .{
         .allocator = allocator,
         .tree = tree,
         .doc_scope = &document_scope,
     };
     defer context.deinit();
-    try walkContainerDecl(&context, tree, 0);
+    switch (tree.mode) {
+        .zig => try walkContainerDecl(&context, tree, 0),
+        .zon => {
+            const root_node = tree.nodes.items(.data)[0].lhs;
+            const new_scope = try context.startScope(
+                .container,
+                .{ .ast_node = root_node },
+                .{ .start = 0, .end = @intCast(tree.source.len) },
+            );
+            try walkNode(&context, tree, root_node);
+            try new_scope.finalize();
+        },
+    }
 
     return document_scope;
 }
@@ -608,18 +840,18 @@ noinline fn walkContainerDecl(
 
     const allocator = context.allocator;
     const tags = tree.nodes.items(.tag);
-    const main_tokens = tree.nodes.items(.main_token);
     const token_tags = tree.tokens.items(.tag);
 
     var buf: [2]Ast.Node.Index = undefined;
     const container_decl = tree.fullContainerDecl(&buf, node_idx).?;
 
-    const is_enum_or_tagged_union = blk: {
-        if (node_idx == 0) break :blk false;
+    const is_enum_or_tagged_union, const is_struct = blk: {
+        if (node_idx == 0) break :blk .{ false, true };
         break :blk switch (token_tags[container_decl.ast.main_token]) {
-            .keyword_enum => true,
-            .keyword_union => container_decl.ast.enum_token != null or container_decl.ast.arg != 0,
-            .keyword_struct, .keyword_opaque => false,
+            .keyword_enum => .{ true, false },
+            .keyword_union => .{ container_decl.ast.enum_token != null or container_decl.ast.arg != 0, false },
+            .keyword_struct => .{ false, true },
+            .keyword_opaque => .{ false, false },
             else => unreachable,
         };
     };
@@ -630,7 +862,7 @@ noinline fn walkContainerDecl(
         locToSmallLoc(offsets.nodeToLoc(tree, node_idx)),
     );
 
-    var uses = std.ArrayListUnmanaged(Ast.Node.Index){};
+    var uses: std.ArrayListUnmanaged(Ast.Node.Index) = .empty;
     defer uses.deinit(allocator);
 
     for (container_decl.ast.members) |decl| {
@@ -648,27 +880,23 @@ noinline fn walkContainerDecl(
             .container_field_init,
             .container_field_align,
             => {
-                if (token_tags[main_tokens[node_idx]] == .keyword_struct and
-                    tree.fullContainerField(decl).?.ast.tuple_like)
-                {
-                    continue;
-                }
+                var container_field = tree.fullContainerField(decl).?;
+                if (is_struct and container_field.ast.tuple_like) continue;
 
-                const main_token = main_tokens[decl];
-                if (token_tags[main_token] != .identifier) {
-                    // TODO this code path should not be reachable
-                    continue;
-                }
-                const name = offsets.identifierTokenToNameSlice(tree, main_token);
-                try scope.pushDeclaration(name, .{ .ast_node = decl }, .field);
+                container_field.convertToNonTupleLike(tree.nodes);
+                if (container_field.ast.tuple_like) continue;
+                const main_token = container_field.ast.main_token;
+                if (token_tags[main_token] != .identifier) continue;
+                try scope.pushDeclaration(main_token, .{ .ast_node = decl }, .field);
 
                 if (is_enum_or_tagged_union) {
+                    const name = offsets.identifierTokenToNameSlice(tree, main_token);
                     if (std.mem.eql(u8, name, "_")) continue;
 
                     const gop = try context.doc_scope.global_enum_set.getOrPutContext(
                         context.allocator,
                         main_token,
-                        IdentifierTokenContext{ .tree = tree },
+                        .{ .tree = tree },
                     );
                     if (!gop.found_existing) {
                         gop.key_ptr.* = main_token;
@@ -686,8 +914,7 @@ noinline fn walkContainerDecl(
             => {
                 var buffer: [1]Ast.Node.Index = undefined;
                 const name_token = tree.fullFnProto(&buffer, decl).?.name_token orelse continue;
-                const name = offsets.identifierTokenToNameSlice(tree, name_token);
-                try scope.pushDeclaration(name, .{ .ast_node = decl }, .other);
+                try scope.pushDeclaration(name_token, .{ .ast_node = decl }, .other);
             },
             .local_var_decl,
             .global_var_decl,
@@ -695,10 +922,7 @@ noinline fn walkContainerDecl(
             .aligned_var_decl,
             => {
                 const name_token = tree.fullVarDecl(decl).?.ast.mut_token + 1;
-                if (name_token >= tree.tokens.len) continue;
-
-                const name = offsets.identifierTokenToNameSlice(tree, name_token);
-                try scope.pushDeclaration(name, .{ .ast_node = decl }, .other);
+                try scope.pushDeclaration(name_token, .{ .ast_node = decl }, .other);
             },
 
             else => unreachable,
@@ -725,8 +949,6 @@ noinline fn walkErrorSetNode(
     node_idx: Ast.Node.Index,
 ) error{OutOfMemory}!void {
     const token_tags = tree.tokens.items(.tag);
-    const data = tree.nodes.items(.data);
-    const main_tokens = tree.nodes.items(.main_token);
 
     const scope = try context.startScope(
         .container,
@@ -734,27 +956,18 @@ noinline fn walkErrorSetNode(
         locToSmallLoc(offsets.nodeToLoc(tree, node_idx)),
     );
 
-    // All identifiers in main_token..data.rhs are error fields.
-    var tok_i = main_tokens[node_idx] + 2;
-    while (tok_i < data[node_idx].rhs) : (tok_i += 1) {
-        switch (token_tags[tok_i]) {
-            .doc_comment, .comma => {},
-            .identifier => {
-                const name = offsets.identifierTokenToNameSlice(tree, tok_i);
-                try scope.pushDeclaration(name, .{ .error_token = tok_i }, .other);
-                const gop = try context.doc_scope.global_error_set.getOrPutContext(
-                    context.allocator,
-                    tok_i,
-                    IdentifierTokenContext{ .tree = tree },
-                );
-                if (!gop.found_existing) {
-                    gop.key_ptr.* = tok_i;
-                } else if (gop.found_existing and token_tags[tok_i - 1] == .doc_comment) {
-                    // a token with a doc comment takes priority.
-                    gop.key_ptr.* = tok_i;
-                }
-            },
-            else => {},
+    var it: ast.ErrorSetIterator = .init(tree, node_idx);
+
+    while (it.next()) |identifier_token| {
+        try scope.pushDeclaration(identifier_token, .{ .error_token = identifier_token }, .other);
+        const gop = try context.doc_scope.global_error_set.getOrPutContext(
+            context.allocator,
+            identifier_token,
+            .{ .tree = tree },
+        );
+        if (!gop.found_existing or token_tags[identifier_token - 1] == .doc_comment) {
+            // a token with a doc comment takes priority.
+            gop.key_ptr.* = identifier_token;
         }
     }
 
@@ -783,8 +996,8 @@ noinline fn walkFuncNode(
     while (ast.nextFnParam(&it)) |param| : (param_index += 1) {
         if (param.name_token) |name_token| {
             try scope.pushDeclaration(
-                offsets.identifierTokenToNameSlice(tree, name_token),
-                .{ .param_payload = .{ .param_index = param_index, .func = node_idx } },
+                name_token,
+                .{ .function_parameter = .{ .param_index = param_index, .func = node_idx } },
                 .other,
             );
         }
@@ -817,10 +1030,8 @@ fn walkBlockNodeKeepOpen(
     start_token: Ast.TokenIndex,
 ) error{OutOfMemory}!ScopeContext.PushedScope {
     const node_tags = tree.nodes.items(.tag);
-    const token_tags = tree.tokens.items(.tag);
     const data = tree.nodes.items(.data);
 
-    const first_token = tree.firstToken(node_idx);
     const last_token = ast.lastToken(tree, node_idx);
 
     const scope = try context.startScope(
@@ -829,12 +1040,11 @@ fn walkBlockNodeKeepOpen(
         locToSmallLoc(offsets.tokensToLoc(tree, start_token, last_token)),
     );
 
-    // if labeled block
-    if (token_tags[first_token] == .identifier) {
+    if (ast.blockLabel(tree, node_idx)) |label_token| {
         try scope.pushDeclaration(
-            offsets.identifierTokenToNameSlice(tree, first_token),
-            .{ .label_decl = .{ .label = first_token, .block = node_idx } },
-            .other,
+            label_token,
+            .{ .label = .{ .identifier = label_token, .block = node_idx } },
+            .label,
         );
     }
 
@@ -850,8 +1060,8 @@ fn walkBlockNodeKeepOpen(
             .simple_var_decl,
             => {
                 const var_decl = tree.fullVarDecl(idx).?;
-                const name = offsets.identifierTokenToNameSlice(tree, var_decl.ast.mut_token + 1);
-                try scope.pushDeclaration(name, .{ .ast_node = idx }, .other);
+                const name_token = var_decl.ast.mut_token + 1;
+                try scope.pushDeclaration(name_token, .{ .ast_node = idx }, .other);
             },
             .assign_destructure => {
                 const lhs_count = tree.extra_data[data[idx].lhs];
@@ -859,9 +1069,9 @@ fn walkBlockNodeKeepOpen(
 
                 for (lhs_exprs, 0..) |lhs_node, i| {
                     const var_decl = tree.fullVarDecl(lhs_node) orelse continue;
-                    const name = offsets.identifierTokenToNameSlice(tree, var_decl.ast.mut_token + 1);
+                    const name_token = var_decl.ast.mut_token + 1;
                     try scope.pushDeclaration(
-                        name,
+                        name_token,
                         .{ .assign_destructure = .{ .node = idx, .index = @intCast(i) } },
                         .other,
                     );
@@ -883,17 +1093,18 @@ noinline fn walkIfNode(
 
     const if_node = ast.fullIf(tree, node_idx).?;
 
+    try walkNode(context, tree, if_node.ast.cond_expr);
+
     if (if_node.payload_token) |payload_token| {
         const name_token = payload_token + @intFromBool(token_tags[payload_token] == .asterisk);
-        const name = offsets.identifierTokenToNameSlice(tree, name_token);
 
         const decl: Declaration = if (if_node.error_token != null)
-            .{ .error_union_payload = .{ .name = name_token, .condition = if_node.ast.cond_expr } }
+            .{ .error_union_payload = .{ .identifier = name_token, .condition = if_node.ast.cond_expr } }
         else
-            .{ .pointer_payload = .{ .name = name_token, .condition = if_node.ast.cond_expr } };
+            .{ .optional_payload = .{ .identifier = name_token, .condition = if_node.ast.cond_expr } };
 
         const then_scope = try walkNodeEnsureScope(context, tree, if_node.ast.then_expr, name_token);
-        try then_scope.pushDeclaration(name, decl, .other);
+        try then_scope.pushDeclaration(name_token, decl, .other);
         try then_scope.finalize();
     } else {
         try walkNode(context, tree, if_node.ast.then_expr);
@@ -901,12 +1112,10 @@ noinline fn walkIfNode(
 
     if (if_node.ast.else_expr != 0) {
         if (if_node.error_token) |error_token| {
-            const name = offsets.identifierTokenToNameSlice(tree, error_token);
-
             const else_scope = try walkNodeEnsureScope(context, tree, if_node.ast.else_expr, error_token);
             try else_scope.pushDeclaration(
-                name,
-                .{ .error_union_error = .{ .name = error_token, .condition = if_node.ast.cond_expr } },
+                error_token,
+                .{ .error_union_error = .{ .identifier = error_token, .condition = if_node.ast.cond_expr } },
                 .other,
             );
             try else_scope.finalize();
@@ -932,12 +1141,10 @@ noinline fn walkCatchNode(
         token_tags[catch_token - 1] == .pipe and
         token_tags[catch_token] == .identifier)
     {
-        const name = offsets.identifierTokenToNameSlice(tree, catch_token);
-
         const expr_scope = try walkNodeEnsureScope(context, tree, data[node_idx].rhs, catch_token);
         try expr_scope.pushDeclaration(
-            name,
-            .{ .error_union_error = .{ .name = catch_token, .condition = data[node_idx].lhs } },
+            catch_token,
+            .{ .error_union_error = .{ .identifier = catch_token, .condition = data[node_idx].lhs } },
             .other,
         );
         try expr_scope.finalize();
@@ -958,46 +1165,39 @@ noinline fn walkWhileNode(
 
     try walkNode(context, tree, while_node.ast.cond_expr);
 
-    const label_token, const label_name = if (while_node.label_token) |label| blk: {
-        std.debug.assert(token_tags[label] == .identifier);
-        const name = offsets.tokenToSlice(tree, label);
-        break :blk .{ label, name };
-    } else .{ null, null };
-
-    const payload_declaration, const payload_name = if (while_node.payload_token) |payload_token| blk: {
+    const payload_declaration, const payload_name_token = if (while_node.payload_token) |payload_token| blk: {
         const name_token = payload_token + @intFromBool(token_tags[payload_token] == .asterisk);
-        const name = offsets.identifierTokenToNameSlice(tree, name_token);
 
         const decl: Declaration = if (while_node.error_token != null)
-            .{ .error_union_payload = .{ .name = name_token, .condition = while_node.ast.cond_expr } }
+            .{ .error_union_payload = .{ .identifier = name_token, .condition = while_node.ast.cond_expr } }
         else
-            .{ .pointer_payload = .{ .name = name_token, .condition = while_node.ast.cond_expr } };
-        break :blk .{ decl, name };
+            .{ .optional_payload = .{ .identifier = name_token, .condition = while_node.ast.cond_expr } };
+        break :blk .{ decl, name_token };
     } else .{ null, null };
 
     if (while_node.ast.cont_expr != 0) {
         if (payload_declaration) |decl| {
             const cont_scope = try walkNodeEnsureScope(context, tree, while_node.ast.cont_expr, tree.firstToken(while_node.ast.cont_expr));
-            try cont_scope.pushDeclaration(payload_name.?, decl, .other);
+            try cont_scope.pushDeclaration(payload_name_token.?, decl, .other);
             try cont_scope.finalize();
         } else {
             try walkNode(context, tree, while_node.ast.cont_expr);
         }
     }
 
-    if (payload_declaration != null or label_token != null) {
+    if (payload_declaration != null or while_node.label_token != null) {
         const then_start = while_node.payload_token orelse tree.firstToken(while_node.ast.then_expr);
         const then_scope = try walkNodeEnsureScope(context, tree, while_node.ast.then_expr, then_start);
 
-        if (label_token) |label| {
+        if (while_node.label_token) |label| {
             try then_scope.pushDeclaration(
-                label_name.?,
-                .{ .label_decl = .{ .label = label, .block = while_node.ast.then_expr } },
-                .other,
+                label,
+                .{ .label = .{ .identifier = label, .block = while_node.ast.then_expr } },
+                .label,
             );
         }
         if (payload_declaration) |decl| {
-            try then_scope.pushDeclaration(payload_name.?, decl, .other);
+            try then_scope.pushDeclaration(payload_name_token.?, decl, .other);
         }
 
         try then_scope.finalize();
@@ -1006,24 +1206,22 @@ noinline fn walkWhileNode(
     }
 
     if (while_node.ast.else_expr != 0) {
-        if (label_token != null or while_node.error_token != null) {
+        if (while_node.label_token != null or while_node.error_token != null) {
             const else_start = while_node.error_token orelse tree.firstToken(while_node.ast.else_expr);
             const else_scope = try walkNodeEnsureScope(context, tree, while_node.ast.else_expr, else_start);
 
-            if (label_token) |label| {
+            if (while_node.label_token) |label| {
                 try else_scope.pushDeclaration(
-                    label_name.?,
-                    .{ .label_decl = .{ .label = label, .block = while_node.ast.then_expr } },
-                    .other,
+                    label,
+                    .{ .label = .{ .identifier = label, .block = while_node.ast.then_expr } },
+                    .label,
                 );
             }
 
             if (while_node.error_token) |error_token| {
-                const name = offsets.identifierTokenToNameSlice(tree, error_token);
-
                 try else_scope.pushDeclaration(
-                    name,
-                    .{ .error_union_error = .{ .name = error_token, .condition = while_node.ast.cond_expr } },
+                    error_token,
+                    .{ .error_union_error = .{ .identifier = error_token, .condition = while_node.ast.cond_expr } },
                     .other,
                 );
             }
@@ -1060,22 +1258,17 @@ noinline fn walkForNode(
 
         if (tree.tokens.items(.tag)[name_token] != .identifier) break;
         try then_scope.pushDeclaration(
-            offsets.identifierTokenToNameSlice(tree, name_token),
-            .{ .array_payload = .{ .identifier = name_token, .array_expr = input } },
+            name_token,
+            .{ .for_loop_payload = .{ .identifier = name_token, .condition = input } },
             .other,
         );
     }
 
-    const label_name = if (for_node.label_token) |label_token|
-        offsets.identifierTokenToNameSlice(context.tree, label_token)
-    else
-        null;
-
     if (for_node.label_token) |label_token| {
         try then_scope.pushDeclaration(
-            label_name.?,
-            .{ .label_decl = .{ .label = label_token, .block = for_node.ast.then_expr } },
-            .other,
+            for_node.label_token.?,
+            .{ .label = .{ .identifier = label_token, .block = for_node.ast.then_expr } },
+            .label,
         );
     }
 
@@ -1085,9 +1278,9 @@ noinline fn walkForNode(
         if (for_node.label_token) |label_token| {
             const else_scope = try walkNodeEnsureScope(context, tree, for_node.ast.else_expr, tree.firstToken(for_node.ast.else_expr));
             try else_scope.pushDeclaration(
-                label_name.?,
-                .{ .label_decl = .{ .label = label_token, .block = for_node.ast.else_expr } },
-                .other,
+                for_node.label_token.?,
+                .{ .label = .{ .identifier = label_token, .block = for_node.ast.else_expr } },
+                .label,
             );
             try else_scope.finalize();
         } else {
@@ -1104,6 +1297,8 @@ noinline fn walkSwitchNode(
     const token_tags = tree.tokens.items(.tag);
     const data = tree.nodes.items(.data);
 
+    try walkNode(context, tree, data[node_idx].lhs);
+
     const extra = tree.extraData(data[node_idx].rhs, Ast.Node.SubRange);
     const cases = tree.extra_data[extra.start..extra.end];
 
@@ -1112,11 +1307,10 @@ noinline fn walkSwitchNode(
 
         if (switch_case.payload_token) |payload_token| {
             const name_token = payload_token + @intFromBool(token_tags[payload_token] == .asterisk);
-            const name = offsets.identifierTokenToNameSlice(tree, name_token);
 
             const expr_scope = try walkNodeEnsureScope(context, tree, switch_case.ast.target_expr, name_token);
             try expr_scope.pushDeclaration(
-                name,
+                name_token,
                 .{ .switch_payload = .{ .node = node_idx, .case_index = @intCast(case_index) } },
                 .other,
             );
@@ -1136,12 +1330,10 @@ noinline fn walkErrdeferNode(
     const payload_token = data[node_idx].lhs;
 
     if (payload_token != 0) {
-        const name = offsets.identifierTokenToNameSlice(tree, payload_token);
-
         const expr_scope = try walkNodeEnsureScope(context, tree, data[node_idx].rhs, payload_token);
         try expr_scope.pushDeclaration(
-            name,
-            .{ .error_union_error = .{ .name = payload_token, .condition = 0 } },
+            payload_token,
+            .{ .error_union_error = .{ .identifier = payload_token, .condition = 0 } },
             .other,
         );
         try expr_scope.finalize();

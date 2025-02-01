@@ -1,10 +1,12 @@
+//! Text diffing between source files.
+
 const std = @import("std");
-const types = @import("lsp.zig");
+const types = @import("lsp").types;
 const offsets = @import("offsets.zig");
 const tracy = @import("tracy");
 const DiffMatchPatch = @import("diffz");
 
-const dmp = DiffMatchPatch{
+const dmp: DiffMatchPatch = .{
     .diff_timeout = 250,
 };
 
@@ -19,7 +21,7 @@ pub fn edits(
     const tracy_zone = tracy.trace(@src());
     defer tracy_zone.end();
 
-    var arena = std.heap.ArenaAllocator.init(allocator);
+    var arena: std.heap.ArenaAllocator = .init(allocator);
     defer arena.deinit();
     const diffs = try dmp.diff(arena.allocator(), before, after, true);
 
@@ -32,7 +34,7 @@ pub fn edits(
         }
     }
 
-    var eds = std.ArrayListUnmanaged(types.TextEdit){};
+    var eds: std.ArrayListUnmanaged(types.TextEdit) = .empty;
     try eds.ensureTotalCapacity(allocator, edit_count);
     errdefer {
         for (eds.items) |edit| allocator.free(edit.newText);
@@ -65,15 +67,12 @@ pub fn edits(
 }
 
 /// Caller owns returned memory.
-/// NOTE: As far as I know, this implementation is actually incorrect
-/// as we use intermediate state, but at the same time, it works so
-/// I really don't want to touch it right now. TODO: Investigate + fix.
 pub fn applyContentChanges(
     allocator: std.mem.Allocator,
     text: []const u8,
     content_changes: []const types.TextDocumentContentChangeEvent,
     encoding: offsets.Encoding,
-) error{ OutOfMemory, InvalidParams }![:0]const u8 {
+) error{OutOfMemory}![:0]const u8 {
     const tracy_zone = tracy.trace(@src());
     defer tracy_zone.end();
 
@@ -82,14 +81,14 @@ pub fn applyContentChanges(
         while (i != 0) {
             i -= 1;
             switch (content_changes[i]) {
-                .TextDocumentContentChangeWholeDocument => |content_change| break :blk .{ i, content_change.text },
-                .TextDocumentContentChangePartial => continue,
+                .literal_1 => |content_change| break :blk .{ i, content_change.text }, // TextDocumentContentChangeWholeDocument
+                .literal_0 => continue, // TextDocumentContentChangePartial
             }
         }
         break :blk .{ null, text };
     };
 
-    var text_array = std.ArrayListUnmanaged(u8){};
+    var text_array: std.ArrayListUnmanaged(u8) = .empty;
     errdefer text_array.deinit(allocator);
 
     try text_array.appendSlice(allocator, last_full_text);
@@ -98,11 +97,10 @@ pub fn applyContentChanges(
     const changes = content_changes[if (last_full_text_index) |index| index + 1 else 0..];
 
     for (changes) |item| {
-        const content_change = item.TextDocumentContentChangePartial;
+        const content_change = item.literal_0; // TextDocumentContentChangePartial
 
-        const start = offsets.maybePositionToIndex(text_array.items, content_change.range.start, encoding) orelse return error.InvalidParams;
-        const end = offsets.maybePositionToIndex(text_array.items, content_change.range.end, encoding) orelse return error.InvalidParams;
-        try text_array.replaceRange(allocator, start, end - start, content_change.text);
+        const loc = offsets.rangeToLoc(text_array.items, content_change.range, encoding);
+        try text_array.replaceRange(allocator, loc.start, loc.end - loc.start, content_change.text);
     }
 
     return try text_array.toOwnedSliceSentinel(allocator, 0);
@@ -111,7 +109,7 @@ pub fn applyContentChanges(
 // https://cs.opensource.google/go/x/tools/+/master:internal/lsp/diff/diff.go;l=40
 
 fn textEditLessThan(_: void, lhs: types.TextEdit, rhs: types.TextEdit) bool {
-    return offsets.rangeLessThan(lhs.range, rhs.range);
+    return offsets.positionLessThan(lhs.range.start, rhs.range.start) or offsets.positionLessThan(lhs.range.end, rhs.range.end);
 }
 
 /// Caller owns returned memory.
@@ -129,18 +127,18 @@ pub fn applyTextEdits(
 
     std.mem.sort(types.TextEdit, text_edits_sortable, {}, textEditLessThan);
 
-    var final_text = std.ArrayListUnmanaged(u8){};
+    var final_text: std.ArrayListUnmanaged(u8) = .empty;
     errdefer final_text.deinit(allocator);
 
     var last: usize = 0;
     for (text_edits_sortable) |te| {
-        const start = offsets.maybePositionToIndex(text, te.range.start, encoding) orelse text.len;
+        const start = offsets.positionToIndex(text, te.range.start, encoding);
         if (start > last) {
             try final_text.appendSlice(allocator, text[last..start]);
             last = start;
         }
         try final_text.appendSlice(allocator, te.newText);
-        last = offsets.maybePositionToIndex(text, te.range.end, encoding) orelse text.len;
+        last = offsets.positionToIndex(text, te.range.end, encoding);
     }
     if (last < text.len) {
         try final_text.appendSlice(allocator, text[last..]);

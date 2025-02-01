@@ -9,12 +9,11 @@ const types = zls.types;
 
 const default_config: Config = .{
     .semantic_tokens = .full,
-    .enable_inlay_hints = true,
     .inlay_hints_exclude_single_argument = false,
     .inlay_hints_show_builtin = true,
 
     .zig_exe_path = test_options.zig_exe_path,
-    .zig_lib_path = null,
+    .zig_lib_path = test_options.zig_lib_path,
     .global_cache_path = test_options.global_cache_path,
 };
 
@@ -25,15 +24,34 @@ pub const Context = struct {
     arena: std.heap.ArenaAllocator,
     file_id: u32 = 0,
 
+    var resolved_config_arena: std.heap.ArenaAllocator.State = undefined;
+    var resolved_config: ?Config = null;
+
     pub fn init() !Context {
         const server = try Server.create(allocator);
         errdefer server.destroy();
 
-        try server.updateConfiguration2(default_config);
+        if (resolved_config) |config| {
+            // The configuration has previously been resolved an stored in `resolved_config`
+            try server.updateConfiguration2(config, .{ .resolve = false });
+        } else {
+            try server.updateConfiguration2(default_config, .{});
+
+            const config_string = try std.json.stringifyAlloc(allocator, server.config, .{ .whitespace = .indent_2 });
+            defer allocator.free(config_string);
+
+            var arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+            errdefer arena.deinit();
+
+            const duped_config = try std.json.parseFromSliceLeaky(Config, arena.allocator(), config_string, .{ .allocate = .alloc_always });
+
+            resolved_config_arena = arena.state;
+            resolved_config = duped_config;
+        }
 
         var context: Context = .{
             .server = server,
-            .arena = std.heap.ArenaAllocator.init(allocator),
+            .arena = .init(allocator),
         };
 
         _ = try context.server.sendRequestSync(context.arena.allocator(), "initialize", .{ .capabilities = .{} });
@@ -51,23 +69,27 @@ pub const Context = struct {
     }
 
     // helper
-    pub fn addDocument(self: *Context, source: []const u8) ![]const u8 {
+    pub fn addDocument(self: *Context, options: struct {
+        uri: ?[]const u8 = null,
+        source: []const u8,
+        mode: std.zig.Ast.Mode = .zig,
+    }) ![]const u8 {
         const fmt = switch (builtin.os.tag) {
-            .windows => "file:///C:\\test-{d}.zig",
-            else => "file:///test-{d}.zig",
+            .windows => "file:///C:\\nonexistent\\test-{d}.{s}",
+            else => "file:///nonexistent/test-{d}.{s}",
         };
-        const uri = try std.fmt.allocPrint(
+        const uri = options.uri orelse try std.fmt.allocPrint(
             self.arena.allocator(),
             fmt,
-            .{self.file_id},
+            .{ self.file_id, @tagName(options.mode) },
         );
 
-        const params = types.DidOpenTextDocumentParams{
+        const params: types.DidOpenTextDocumentParams = .{
             .textDocument = .{
                 .uri = uri,
-                .languageId = .{ .custom_value = "zig" }, // no zig :(
+                .languageId = "zig",
                 .version = 420,
-                .text = source,
+                .text = options.source,
             },
         };
 

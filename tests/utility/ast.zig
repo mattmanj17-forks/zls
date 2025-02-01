@@ -2,10 +2,8 @@ const std = @import("std");
 const zls = @import("zls");
 
 const helper = @import("../helper.zig");
-const Context = @import("../context.zig").Context;
 const ErrorBuilder = @import("../ErrorBuilder.zig");
 
-const types = zls.types;
 const offsets = zls.offsets;
 const ast = zls.ast;
 
@@ -68,70 +66,6 @@ test "nodesAtLoc" {
     );
 }
 
-test "smallestEnclosingSubrange" {
-    const children = &[_]offsets.Loc{
-        .{ .start = 0, .end = 5 },
-        .{ .start = 5, .end = 10 },
-        .{ .start = 12, .end = 18 },
-        .{ .start = 18, .end = 22 },
-        .{ .start = 25, .end = 28 },
-    };
-
-    try std.testing.expect(ast.smallestEnclosingSubrange(&.{}, undefined) == null);
-
-    // children  <-->
-    // loc       <--->
-    // result    null
-    try std.testing.expect(
-        ast.smallestEnclosingSubrange(&.{.{ .start = 0, .end = 4 }}, .{ .start = 0, .end = 5 }) == null,
-    );
-
-    // children  <---><--->  <----><-->   <->
-    // loc       <---------------------------->
-    // result    null
-    try std.testing.expect(ast.smallestEnclosingSubrange(children, .{ .start = 0, .end = 30 }) == null);
-
-    // children  <---><--->  <----><-->   <->
-    // loc             <--------->
-    // result         <--->  <---->
-    const result1 = ast.smallestEnclosingSubrange(children, .{ .start = 6, .end = 17 }).?;
-    try std.testing.expectEqualSlices(
-        offsets.Loc,
-        children[1..3],
-        children[result1.start .. result1.start + result1.len],
-    );
-
-    // children  <---><--->  <----><-->   <->
-    // loc            <------------->
-    // result         <--->  <----><-->
-    const result2 = ast.smallestEnclosingSubrange(children, .{ .start = 6, .end = 20 }).?;
-    try std.testing.expectEqualSlices(
-        offsets.Loc,
-        children[1..4],
-        children[result2.start .. result2.start + result2.len],
-    );
-
-    // children  <---><--->  <----><-->   <->
-    // loc                 <----------->
-    // result         <--->  <----><-->   <->
-    const result3 = ast.smallestEnclosingSubrange(children, .{ .start = 10, .end = 23 }).?;
-    try std.testing.expectEqualSlices(
-        offsets.Loc,
-        children[1..5],
-        children[result3.start .. result3.start + result3.len],
-    );
-
-    // children  <---><--->  <----><-->   <->
-    // loc                 <>
-    // result         <--->  <---->
-    const result4 = ast.smallestEnclosingSubrange(children, .{ .start = 10, .end = 12 }).?;
-    try std.testing.expectEqualSlices(
-        offsets.Loc,
-        children[1..3],
-        children[result4.start .. result4.start + result4.len],
-    );
-}
-
 fn testNodesAtLoc(source: []const u8) !void {
     var ccp = try helper.collectClearPlaceholders(allocator, source);
     defer ccp.deinit(allocator);
@@ -145,8 +79,8 @@ fn testNodesAtLoc(source: []const u8) !void {
     std.debug.assert(std.mem.eql(u8, offsets.locToSlice(source, old_locs[2]), "<inner>"));
     std.debug.assert(std.mem.eql(u8, offsets.locToSlice(source, old_locs[3]), "<outer>"));
 
-    const inner_loc = offsets.Loc{ .start = locs[1].start, .end = locs[2].start };
-    const outer_loc = offsets.Loc{ .start = locs[0].start, .end = locs[3].end };
+    const inner_loc: offsets.Loc = .{ .start = locs[1].start, .end = locs[2].start };
+    const outer_loc: offsets.Loc = .{ .start = locs[0].start, .end = locs[3].end };
 
     const new_source = try allocator.dupeZ(u8, ccp.new_source);
     defer allocator.free(new_source);
@@ -157,13 +91,13 @@ fn testNodesAtLoc(source: []const u8) !void {
     const nodes = try ast.nodesAtLoc(allocator, tree, inner_loc);
     defer allocator.free(nodes);
 
-    const actual_loc = offsets.Loc{
+    const actual_loc: offsets.Loc = .{
         .start = offsets.nodeToLoc(tree, nodes[0]).start,
         .end = offsets.nodeToLoc(tree, nodes[nodes.len - 1]).end,
     };
 
     const uri = "file.zig";
-    var error_builder = ErrorBuilder.init(allocator);
+    var error_builder: ErrorBuilder = .init(allocator);
     defer error_builder.deinit();
     errdefer error_builder.writeDebug();
 

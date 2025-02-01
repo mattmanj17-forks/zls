@@ -1,6 +1,5 @@
 const std = @import("std");
 const zls = @import("zls");
-const builtin = @import("builtin");
 
 const Context = @import("../context.zig").Context;
 
@@ -8,7 +7,7 @@ const types = zls.types;
 
 const allocator: std.mem.Allocator = std.testing.allocator;
 
-test "documentSymbol - container decl" {
+test "container decl" {
     try testDocumentSymbol(
         \\const S = struct {
         \\    fn f() void {}
@@ -27,6 +26,9 @@ test "documentSymbol - container decl" {
         \\  Field alpha
         \\  Function f
     );
+}
+
+test "tuple" {
     try testDocumentSymbol(
         \\const S = struct {
         \\    []const u8,
@@ -37,7 +39,7 @@ test "documentSymbol - container decl" {
     );
 }
 
-test "documentSymbol - enum" {
+test "enum" {
     try testDocumentSymbol(
         \\const E = enum {
         \\    alpha,
@@ -50,7 +52,7 @@ test "documentSymbol - enum" {
     );
 }
 
-test "documentSymbol - test decl" {
+test "test decl" {
     try testDocumentSymbol(
         \\test foo {}
         \\test "bar" {}
@@ -62,7 +64,7 @@ test "documentSymbol - test decl" {
 }
 
 // https://github.com/zigtools/zls/issues/1583
-test "documentSymbol - builtin" {
+test "builtin" {
     try testDocumentSymbol(
         \\comptime {
         \\    @abs();
@@ -76,7 +78,7 @@ test "documentSymbol - builtin" {
 }
 
 // https://github.com/zigtools/zls/issues/986
-test "documentSymbol - nested struct with self" {
+test "nested struct with self" {
     try testDocumentSymbol(
         \\const Foo = struct {
         \\    const Self = @This();
@@ -92,12 +94,12 @@ test "documentSymbol - nested struct with self" {
 }
 
 fn testDocumentSymbol(source: []const u8, want: []const u8) !void {
-    var ctx = try Context.init();
+    var ctx: Context = try .init();
     defer ctx.deinit();
 
-    const test_uri = try ctx.addDocument(source);
+    const test_uri = try ctx.addDocument(.{ .source = source });
 
-    const params = types.DocumentSymbolParams{
+    const params: types.DocumentSymbolParams = .{
         .textDocument = .{ .uri = test_uri },
     };
 
@@ -106,10 +108,10 @@ fn testDocumentSymbol(source: []const u8, want: []const u8) !void {
         return error.InvalidResponse;
     };
 
-    var got = std.ArrayListUnmanaged(u8){};
+    var got: std.ArrayListUnmanaged(u8) = .empty;
     defer got.deinit(allocator);
 
-    var stack = std.BoundedArray([]const types.DocumentSymbol, 16){};
+    var stack: std.BoundedArray([]const types.DocumentSymbol, 16) = .{};
     stack.appendAssumeCapacity(response.array_of_DocumentSymbol);
 
     var writer = got.writer(allocator);

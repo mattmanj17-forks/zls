@@ -1,11 +1,12 @@
+//! Implementation of [`textDocument/inlayHint`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#textDocument_inlayHint)
+
 const std = @import("std");
-const zig_builtin = @import("builtin");
 const Ast = std.zig.Ast;
-const log = std.log.scoped(.zls_inlay_hint);
+const log = std.log.scoped(.inlay_hint);
 
 const DocumentStore = @import("../DocumentStore.zig");
 const Analyser = @import("../analysis.zig");
-const types = @import("../lsp.zig");
+const types = @import("lsp").types;
 const offsets = @import("../offsets.zig");
 const tracy = @import("tracy");
 const ast = @import("../ast.zig");
@@ -13,10 +14,129 @@ const Config = @import("../Config.zig");
 
 const data = @import("version_data");
 
-/// don't show inlay hints for the given builtin functions
-/// this option is rare and is therefore build-only and
-/// non-configurable at runtime
-pub const inlay_hints_exclude_builtins: []const u8 = &.{};
+/// don't show inlay hints for builtin functions whose parameter names carry no
+/// meaningful information or are trivial deductible based on the builtin name.
+const excluded_builtins_set: std.StaticStringMap(void) = blk: {
+    @setEvalBranchQuota(2000);
+    break :blk .initComptime(.{
+        .{"addrSpaceCast"},
+        .{"addWithOverflow"},
+        .{"alignCast"},
+        .{"alignOf"},
+        .{"as"},
+        // .{"atomicLoad"},
+        // .{"atomicRmw"},
+        // .{"atomicStore"},
+        .{"bitCast"},
+        .{"bitOffsetOf"},
+        .{"bitSizeOf"},
+        .{"branchHint"},
+        .{"breakpoint"}, // no parameters
+        // .{"mulAdd"},
+        .{"byteSwap"},
+        .{"bitReverse"},
+        .{"offsetOf"},
+        // .{"call"},
+        .{"cDefine"},
+        .{"cImport"},
+        .{"cInclude"},
+        .{"clz"},
+        // .{"cmpxchgStrong"},
+        // .{"cmpxchgWeak"},
+        // .{"compileError"},
+        .{"compileLog"}, // variadic
+        .{"constCast"},
+        .{"ctz"},
+        .{"cUndef"},
+        // .{"cVaArg"},
+        // .{"cVaCopy"},
+        // .{"cVaEnd"},
+        // .{"cVaStart"},
+        .{"divExact"},
+        .{"divFloor"},
+        .{"divTrunc"},
+        .{"embedFile"},
+        .{"enumFromInt"},
+        .{"errorFromInt"},
+        .{"errorName"},
+        .{"errorReturnTrace"}, // no parameters
+        .{"errorCast"},
+        // .{"export"},
+        // .{"extern"},
+        // .{"field"},
+        // .{"fieldParentPtr"},
+        // .{"FieldType"},
+        .{"floatCast"},
+        .{"floatFromInt"},
+        .{"frameAddress"}, // no parameters
+        // .{"hasDecl"},
+        // .{"hasField"},
+        .{"import"},
+        .{"inComptime"}, // no parameters
+        .{"intCast"},
+        .{"intFromBool"},
+        .{"intFromEnum"},
+        .{"intFromError"},
+        .{"intFromFloat"},
+        .{"intFromPtr"},
+        .{"max"},
+        // .{"memcpy"},
+        // .{"memset"},
+        .{"min"},
+        // .{"wasmMemorySize"},
+        // .{"wasmMemoryGrow"},
+        .{"mod"},
+        .{"mulWithOverflow"},
+        // .{"panic"},
+        .{"popCount"},
+        // .{"prefetch"},
+        .{"ptrCast"},
+        .{"ptrFromInt"},
+        .{"rem"},
+        .{"returnAddress"}, // no parameters
+        // .{"select"},
+        .{"setEvalBranchQuota"},
+        .{"setFloatMode"},
+        .{"setRuntimeSafety"},
+        // .{"shlExact"},
+        // .{"shlWithOverflow"},
+        // .{"shrExact"},
+        // .{"shuffle"},
+        .{"sizeOf"},
+        // .{"splat"},
+        // .{"reduce"},
+        .{"src"}, // no parameters
+        .{"sqrt"},
+        .{"sin"},
+        .{"cos"},
+        .{"tan"},
+        .{"exp"},
+        .{"exp2"},
+        .{"log"},
+        .{"log2"},
+        .{"log10"},
+        .{"abs"},
+        .{"floor"},
+        .{"ceil"},
+        .{"trunc"},
+        .{"round"},
+        .{"subWithOverflow"},
+        .{"tagName"},
+        .{"This"}, // no parameters
+        .{"trap"}, // no parameters
+        .{"truncate"},
+        .{"Type"},
+        .{"typeInfo"},
+        .{"typeName"},
+        .{"TypeOf"}, // variadic
+        // .{"unionInit"},
+        // .{"Vector"},
+        .{"volatileCast"},
+        // .{"workGroupId"},
+        // .{"workGroupSize"},
+        // .{"workItemId"},
+    });
+};
 
 pub const InlayHint = struct {
     index: usize,
@@ -34,7 +154,7 @@ const Builder = struct {
     analyser: *Analyser,
     config: *const Config,
     handle: *DocumentStore.Handle,
-    hints: std.ArrayListUnmanaged(InlayHint) = .{},
+    hints: std.ArrayListUnmanaged(InlayHint) = .empty,
     hover_kind: types.MarkupKind,
 
     fn appendParameterHint(self: *Builder, token_index: Ast.TokenIndex, label: []const u8, tooltip: []const u8, tooltip_noalias: bool, tooltip_comptime: bool) !void {
@@ -62,23 +182,24 @@ const Builder = struct {
     }
 
     fn getInlayHints(self: *Builder, offset_encoding: offsets.Encoding) error{OutOfMemory}![]types.InlayHint {
-        std.mem.sort(InlayHint, self.hints.items, {}, InlayHint.lessThan);
+        const source_indices = try self.arena.alloc(usize, self.hints.items.len);
+        for (source_indices, self.hints.items) |*index, hint| {
+            index.* = hint.index;
+        }
 
-        var last_index: usize = 0;
-        var last_position: types.Position = .{ .line = 0, .character = 0 };
+        const positions = try self.arena.alloc(types.Position, self.hints.items.len);
+
+        try offsets.multiple.indexToPosition(
+            self.arena,
+            self.handle.tree.source,
+            source_indices,
+            positions,
+            offset_encoding,
+        );
 
         const converted_hints = try self.arena.alloc(types.InlayHint, self.hints.items.len);
-        for (converted_hints, self.hints.items) |*converted_hint, hint| {
-            const position = offsets.advancePosition(
-                self.handle.tree.source,
-                last_position,
-                last_index,
-                hint.index,
-                offset_encoding,
-            );
-            defer last_index = hint.index;
-            defer last_position = position;
-            converted_hint.* = types.InlayHint{
+        for (converted_hints, self.hints.items, positions) |*converted_hint, hint, position| {
+            converted_hint.* = .{
                 .position = position,
                 .label = .{ .string = hint.label },
                 .kind = hint.kind,
@@ -87,27 +208,31 @@ const Builder = struct {
                 .paddingRight = hint.kind == .Parameter,
             };
         }
+
         return converted_hints;
     }
 };
 
-/// `call` is the function call
-/// `ty` should be a function protototype
 /// writes parameter hints into `builder.hints`
-fn writeCallHint(builder: *Builder, call: Ast.full.Call, ty: Analyser.Type) !void {
+fn writeCallHint(
+    builder: *Builder,
+    /// The function call.
+    call: Ast.full.Call,
+) !void {
     const tracy_zone = tracy.trace(@src());
     defer tracy_zone.end();
 
     const handle = builder.handle;
     const tree = handle.tree;
 
+    const ty = try builder.analyser.resolveTypeOfNode(.{ .node = call.ast.fn_expr, .handle = handle }) orelse return;
     const fn_ty = try builder.analyser.resolveFuncProtoOfCallable(ty) orelse return;
     const fn_node = fn_ty.data.other; // this assumes that function types can only be Ast nodes
 
     var buffer: [1]Ast.Node.Index = undefined;
     const fn_proto = fn_node.handle.tree.fullFnProto(&buffer, fn_node.node).?;
 
-    var params = try std.ArrayListUnmanaged(Ast.full.FnProto.Param).initCapacity(builder.arena, fn_proto.ast.params.len);
+    var params: std.ArrayListUnmanaged(Ast.full.FnProto.Param) = try .initCapacity(builder.arena, fn_proto.ast.params.len);
     defer params.deinit(builder.arena);
 
     var it = fn_proto.iterate(&fn_node.handle.tree);
@@ -116,7 +241,7 @@ fn writeCallHint(builder: *Builder, call: Ast.full.Call, ty: Analyser.Type) !voi
     }
 
     const has_self_param = call.ast.params.len + 1 == params.items.len and
-        try builder.analyser.isInstanceCall(handle, call, fn_node.handle, fn_proto);
+        try builder.analyser.isInstanceCall(handle, call, fn_ty);
 
     const parameters = params.items[@intFromBool(has_self_param)..];
     const arguments = call.ast.params;
@@ -201,33 +326,17 @@ fn writeBuiltinHint(builder: *Builder, parameters: []const Ast.Node.Index, argum
     }
 }
 
-// Restrict whitespace to only one space at a time.
-// TODO: Reduce long type hints (>x characters) to just the overall type i.e. `struct { .. }`.
-fn reduceTypeWhitespace(str: []const u8, arena: std.mem.Allocator) ![]const u8 {
-    // Overallocates by a small amount if whitespace is reduced, but it should be fine.
-    var reduced_type_str = try std.ArrayListUnmanaged(u8).initCapacity(arena, str.len);
-    var skip = false;
-    for (str) |char| {
-        if (char == '\n' or char == ' ') {
-            if (!skip) {
-                reduced_type_str.appendAssumeCapacity(' ');
-            }
-            skip = true;
-        } else {
-            reduced_type_str.appendAssumeCapacity(char);
-            skip = false;
-        }
-    }
-    return reduced_type_str.items;
-}
-
 fn typeStrOfNode(builder: *Builder, node: Ast.Node.Index) !?[]const u8 {
     const resolved_type = try builder.analyser.resolveTypeOfNode(.{ .handle = builder.handle, .node = node }) orelse return null;
 
-    const type_str: []const u8 = try std.fmt.allocPrint(builder.arena, "{}", .{resolved_type.fmt(builder.analyser)});
+    const type_str: []const u8 = try std.fmt.allocPrint(
+        builder.arena,
+        "{}",
+        .{resolved_type.fmt(builder.analyser, .{ .truncate_container_decls = true })},
+    );
     if (type_str.len == 0) return null;
 
-    return try reduceTypeWhitespace(type_str, builder.arena);
+    return type_str;
 }
 
 fn typeStrOfToken(builder: *Builder, token: Ast.TokenIndex) !?[]const u8 {
@@ -238,10 +347,14 @@ fn typeStrOfToken(builder: *Builder, token: Ast.TokenIndex) !?[]const u8 {
     ) orelse return null;
     const resolved_type = try things.resolveType(builder.analyser) orelse return null;
 
-    const type_str: []const u8 = try std.fmt.allocPrint(builder.arena, "{}", .{resolved_type.fmt(builder.analyser)});
+    const type_str: []const u8 = try std.fmt.allocPrint(
+        builder.arena,
+        "{}",
+        .{resolved_type.fmt(builder.analyser, .{ .truncate_container_decls = true })},
+    );
     if (type_str.len == 0) return null;
 
-    return try reduceTypeWhitespace(type_str, builder.arena);
+    return type_str;
 }
 
 /// Append a hint in the form `: hint`
@@ -275,17 +388,13 @@ fn writeForCaptureHint(builder: *Builder, for_node: Ast.Node.Index) !void {
     var capture_token = full_for.payload_token;
     for (full_for.ast.inputs) |_| {
         if (capture_token + 1 >= tree.tokens.len) break;
-        const capture_by_ref = token_tags[capture_token] == .asterisk;
-        const name_token = capture_token + @intFromBool(capture_by_ref);
-        if (try typeStrOfToken(builder, name_token)) |type_str| {
-            const prepend = if (capture_by_ref) "*" else "";
-            try appendTypeHintString(
-                builder,
-                name_token,
-                try std.fmt.allocPrint(builder.arena, "{s}{s}", .{ prepend, type_str }),
-            );
-        }
+        const capture_is_ref = token_tags[capture_token] == .asterisk;
+        const name_token = capture_token + @intFromBool(capture_is_ref);
         capture_token = name_token + 2;
+
+        if (try typeStrOfToken(builder, name_token)) |type_str| {
+            try appendTypeHintString(builder, name_token, type_str);
+        }
     }
 }
 
@@ -302,14 +411,7 @@ fn writeCallNodeHint(builder: *Builder, call: Ast.full.Call) !void {
     const node_tags = tree.nodes.items(.tag);
 
     switch (node_tags[call.ast.fn_expr]) {
-        .identifier => {
-            const ty = try builder.analyser.resolveTypeOfNode(.{ .node = call.ast.fn_expr, .handle = handle }) orelse return;
-            try writeCallHint(builder, call, ty);
-        },
-        .field_access => {
-            const ty = try builder.analyser.resolveTypeOfNode(.{ .node = call.ast.fn_expr, .handle = handle }) orelse return;
-            try writeCallHint(builder, call, ty);
-        },
+        .identifier, .field_access => try writeCallHint(builder, call),
         else => {
             log.debug("cannot deduce fn expression with tag '{}'", .{node_tags[call.ast.fn_expr]});
         },
@@ -357,6 +459,18 @@ fn writeNodeInlayHint(
                 var_decl.ast.mut_token + 1,
                 try typeStrOfNode(builder, node) orelse return,
             );
+        },
+        .assign_destructure => {
+            if (!builder.config.inlay_hints_show_variable_type_hints) return;
+            const dat = tree.nodes.items(.data);
+            const lhs_count = tree.extra_data[dat[node].lhs];
+            const lhs_exprs = tree.extra_data[dat[node].lhs + 1 ..][0..lhs_count];
+
+            for (lhs_exprs) |lhs_node| {
+                const var_decl = tree.fullVarDecl(lhs_node) orelse continue;
+                if (var_decl.ast.type_node != 0) continue;
+                try inferAppendTypeStr(builder, var_decl.ast.mut_token + 1);
+            }
         },
         .if_simple,
         .@"if",
@@ -408,20 +522,15 @@ fn writeNodeInlayHint(
         => {
             if (!builder.config.inlay_hints_show_parameter_name or !builder.config.inlay_hints_show_builtin) return;
 
+            const name = tree.tokenSlice(main_tokens[node]);
+            if (name.len < 2 or excluded_builtins_set.has(name[1..])) return;
+
             var buffer: [2]Ast.Node.Index = undefined;
             const params = ast.builtinCallParams(tree, node, &buffer).?;
 
             if (params.len == 0) return;
 
-            const name = tree.tokenSlice(main_tokens[node]);
-
-            outer: for (data.builtins) |builtin| {
-                if (!std.mem.eql(u8, builtin.name, name)) continue;
-
-                for (inlay_hints_exclude_builtins) |builtin_name| {
-                    if (std.mem.eql(u8, builtin_name, name)) break :outer;
-                }
-
+            if (data.builtins.get(name)) |builtin| {
                 try writeBuiltinHint(builder, params, builtin.arguments);
             }
         },
@@ -443,12 +552,16 @@ fn writeNodeInlayHint(
                 const name = offsets.locToSlice(tree.source, name_loc);
                 const decl = (try builder.analyser.getSymbolEnumLiteral(builder.arena, builder.handle, name_loc.start, name)) orelse continue;
                 const ty = try decl.resolveType(builder.analyser) orelse continue;
-                const type_str: []const u8 = try std.fmt.allocPrint(builder.arena, "{}", .{ty.fmt(builder.analyser)});
+                const type_str: []const u8 = try std.fmt.allocPrint(
+                    builder.arena,
+                    "{}",
+                    .{ty.fmt(builder.analyser, .{ .truncate_container_decls = true })},
+                );
                 if (type_str.len == 0) continue;
                 try appendTypeHintString(
                     builder,
                     name_token,
-                    try reduceTypeWhitespace(type_str, builder.arena),
+                    type_str,
                 );
             }
         },

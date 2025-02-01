@@ -5,7 +5,7 @@ const offsets = zls.offsets;
 
 /// returns an array of all placeholder locations
 pub fn collectPlaceholderLocs(allocator: std.mem.Allocator, source: []const u8) ![]offsets.Loc {
-    var locations = std.ArrayListUnmanaged(offsets.Loc){};
+    var locations: std.ArrayListUnmanaged(offsets.Loc) = .empty;
     errdefer locations.deinit(allocator);
 
     var source_index: usize = 0;
@@ -25,7 +25,7 @@ pub fn collectPlaceholderLocs(allocator: std.mem.Allocator, source: []const u8) 
 
 /// returns `source` where every placeholder is replaced with `new_name`
 pub fn replacePlaceholders(allocator: std.mem.Allocator, source: []const u8, new_name: []const u8) ![]const u8 {
-    var output = std.ArrayListUnmanaged(u8){};
+    var output: std.ArrayListUnmanaged(u8) = .empty;
     errdefer output.deinit(allocator);
 
     var source_index: usize = 0;
@@ -69,10 +69,10 @@ pub fn collectClearPlaceholders(allocator: std.mem.Allocator, source: []const u8
 }
 
 pub fn collectReplacePlaceholders(allocator: std.mem.Allocator, source: []const u8, new_name: []const u8) !CollectPlaceholdersResult {
-    var locations = std.MultiArrayList(CollectPlaceholdersResult.LocPair){};
+    var locations: std.MultiArrayList(CollectPlaceholdersResult.LocPair) = .empty;
     errdefer locations.deinit(allocator);
 
-    var new_source = std.ArrayListUnmanaged(u8){};
+    var new_source: std.ArrayListUnmanaged(u8) = .empty;
     errdefer new_source.deinit(allocator);
 
     var source_index: usize = 0;
@@ -103,7 +103,7 @@ pub fn collectReplacePlaceholders(allocator: std.mem.Allocator, source: []const 
     }
     try new_source.appendSlice(allocator, source[source_index..source.len]);
 
-    return CollectPlaceholdersResult{
+    return .{
         .locations = locations,
         .new_source = try new_source.toOwnedSlice(allocator),
     };
@@ -135,7 +135,7 @@ fn testCollectReplacePlaceholders(
     try std.testing.expectEqualSlices(offsets.Loc, expected_new_locs, result.locations.items(.new));
 }
 
-test "helper - collectReplacePlaceholders" {
+test collectReplacePlaceholders {
     try testCollectReplacePlaceholders("", "", &.{}, &.{});
     try testCollectReplacePlaceholders("text", "text", &.{}, &.{});
 

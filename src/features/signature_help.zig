@@ -1,10 +1,12 @@
+//! Implementation of [`textDocument/signatureHelp`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#textDocument_signatureHelp)
+
 const std = @import("std");
 const Ast = std.zig.Ast;
 const Token = std.zig.Token;
 
 const Analyser = @import("../analysis.zig");
 const DocumentStore = @import("../DocumentStore.zig");
-const types = @import("../lsp.zig");
+const types = @import("lsp").types;
 const ast = @import("../ast.zig");
 const offsets = @import("../offsets.zig");
 
@@ -29,11 +31,11 @@ fn fnProtoToSignatureInfo(
     const proto_comments = try Analyser.getDocComments(arena, tree, fn_node);
 
     const arg_idx = if (skip_self_param) blk: {
-        const has_self_param = try analyser.hasSelfParam(fn_handle, proto);
+        const has_self_param = try analyser.hasSelfParam(func_type);
         break :blk commas + @intFromBool(has_self_param);
     } else commas;
 
-    var params = std.ArrayListUnmanaged(types.ParameterInformation){};
+    var params: std.ArrayListUnmanaged(types.ParameterInformation) = .empty;
     var param_it = proto.iterate(&tree);
     while (ast.nextFnParam(&param_it)) |param| {
         const param_comments = if (param.first_doc_comment) |dc|
@@ -42,7 +44,7 @@ fn fnProtoToSignatureInfo(
             null;
 
         try params.append(arena, .{
-            .label = .{ .string = ast.paramSlice(tree, param) },
+            .label = .{ .string = ast.paramSlice(tree, param, false) },
             .documentation = if (param_comments) |comment| .{ .MarkupContent = .{
                 .kind = markup_kind,
                 .value = comment,
@@ -113,9 +115,9 @@ pub fn getSignatureInfo(
             };
         }
     };
-    var symbol_stack = try std.ArrayListUnmanaged(StackSymbol).initCapacity(arena, 8);
+    var symbol_stack: std.ArrayListUnmanaged(StackSymbol) = try .initCapacity(arena, 8);
     var curr_commas: u32 = 0;
-    var comma_stack = try std.ArrayListUnmanaged(u32).initCapacity(arena, 4);
+    var comma_stack: std.ArrayListUnmanaged(u32) = try .initCapacity(arena, 4);
     var curr_token = last_token;
     while (curr_token >= first_token and curr_token != 0) : (curr_token -= 1) {
         switch (token_tags[curr_token]) {
@@ -178,27 +180,23 @@ pub fn getSignatureInfo(
                 const expr_last_token = curr_token - 1;
                 if (token_tags[expr_last_token] == .builtin) {
                     // Builtin token, find the builtin and construct signature information.
-                    for (data.builtins) |builtin| {
-                        if (std.mem.eql(u8, builtin.name, tree.tokenSlice(expr_last_token))) {
-                            const param_infos = try arena.alloc(
-                                types.ParameterInformation,
-                                builtin.arguments.len,
-                            );
-                            for (param_infos, builtin.arguments) |*info, argument| {
-                                info.* = .{
-                                    .label = .{ .string = argument },
-                                    .documentation = null,
-                                };
-                            }
-                            return types.SignatureInformation{
-                                .label = builtin.signature,
-                                .documentation = .{ .string = builtin.documentation },
-                                .parameters = param_infos,
-                                .activeParameter = paren_commas,
-                            };
-                        }
+                    const builtin = data.builtins.get(tree.tokenSlice(expr_last_token)) orelse return null;
+                    const param_infos = try arena.alloc(
+                        types.ParameterInformation,
+                        builtin.arguments.len,
+                    );
+                    for (param_infos, builtin.arguments) |*info, argument| {
+                        info.* = .{
+                            .label = .{ .string = argument },
+                            .documentation = null,
+                        };
                     }
-                    return null;
+                    return types.SignatureInformation{
+                        .label = builtin.signature,
+                        .documentation = .{ .string = builtin.documentation },
+                        .parameters = param_infos,
+                        .activeParameter = paren_commas,
+                    };
                 }
                 // Scan for a function call lhs expression.
                 var state: union(enum) {
@@ -240,9 +238,21 @@ pub fn getSignatureInfo(
                     continue;
                 }
 
-                const loc = offsets.tokensToLoc(tree, expr_first_token, expr_last_token);
+                var loc = offsets.tokensToLoc(tree, expr_first_token, expr_last_token);
 
-                var ty = try analyser.getFieldAccessType(handle, loc.start, loc) orelse continue;
+                var ty = switch (tree.tokens.items(.tag)[expr_first_token]) {
+                    .period => blk: { // decl literal
+                        loc.start += 1;
+                        const decl = try analyser.getSymbolEnumLiteral(
+                            arena,
+                            handle,
+                            loc.start,
+                            offsets.locToSlice(tree.source, loc),
+                        ) orelse continue;
+                        break :blk try decl.resolveType(analyser) orelse continue;
+                    },
+                    else => try analyser.getFieldAccessType(handle, loc.start, loc) orelse continue,
+                };
 
                 if (try analyser.resolveFuncProtoOfCallable(ty)) |func_type| {
                     return try fnProtoToSignatureInfo(
@@ -255,7 +265,7 @@ pub fn getSignatureInfo(
                     );
                 }
 
-                const name_loc = Analyser.identifierLocFromPosition(loc.end - 1, handle) orelse {
+                const name_loc = Analyser.identifierLocFromIndex(handle.tree, loc.end - 1) orelse {
                     try symbol_stack.append(arena, .l_paren);
                     continue;
                 };

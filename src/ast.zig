@@ -14,11 +14,14 @@ fn fullPtrTypeComponents(tree: Ast, info: full.PtrType.Components) full.PtrType 
         .asterisk,
         .asterisk_asterisk,
         => switch (token_tags[info.main_token + 1]) {
-            .r_bracket, .colon => .Many,
-            .identifier => if (info.main_token != 0 and token_tags[info.main_token - 1] == .l_bracket) .C else .One,
-            else => .One,
+            .r_bracket, .colon => .many,
+            .identifier => if (info.main_token != 0 and token_tags[info.main_token - 1] == .l_bracket) .c else .one,
+            else => .one,
         },
-        .l_bracket => .Slice,
+        .l_bracket => switch (token_tags[info.main_token + 1]) {
+            .asterisk => if (token_tags[info.main_token + 2] == .identifier) .c else .many,
+            else => .slice,
+        },
         else => unreachable,
     };
     var result: full.PtrType = .{
@@ -32,7 +35,10 @@ fn fullPtrTypeComponents(tree: Ast, info: full.PtrType.Components) full.PtrType 
     // here while looking for modifiers as that could result in false
     // positives. Therefore, start after a sentinel if there is one and
     // skip over any align node and bit range nodes.
-    var i = if (info.sentinel != 0) lastToken(tree, info.sentinel) + 1 else info.main_token;
+    var i = if (info.sentinel != 0) tree.lastToken(info.sentinel) + 1 else switch (size) {
+        .many, .c => info.main_token + 1,
+        else => info.main_token,
+    };
     const end = tree.firstToken(info.child_type);
     while (i < end) : (i += 1) {
         switch (token_tags[i]) {
@@ -543,7 +549,7 @@ pub fn lastToken(tree: Ast, node: Ast.Node.Index) Ast.TokenIndex {
             }
         },
         .@"defer" => {
-            // rhs is the defered expr
+            // rhs is the deferred expr
             if (datas[n].rhs != 0) {
                 n = datas[n].rhs;
             } else {
@@ -1116,14 +1122,48 @@ pub fn lastToken(tree: Ast, node: Ast.Node.Index) Ast.TokenIndex {
     };
 }
 
+pub fn testDeclNameToken(tree: Ast, test_decl_node: Ast.Node.Index) ?Ast.TokenIndex {
+    std.debug.assert(tree.nodes.items(.tag)[test_decl_node] == .test_decl);
+    const node_datas = tree.nodes.items(.data);
+    if (node_datas[test_decl_node].lhs == 0) return null;
+    return node_datas[test_decl_node].lhs;
+}
+
+pub fn testDeclNameAndToken(tree: Ast, test_decl_node: Ast.Node.Index) ?struct { Ast.TokenIndex, []const u8 } {
+    const test_name_token = testDeclNameToken(tree, test_decl_node) orelse return null;
+
+    switch (tree.tokens.items(.tag)[test_name_token]) {
+        .string_literal => {
+            const name = offsets.tokenToSlice(tree, test_name_token);
+            return .{ test_name_token, name[1 .. name.len - 1] };
+        },
+        .identifier => return .{ test_name_token, offsets.identifierTokenToNameSlice(tree, test_name_token) },
+        else => return null,
+    }
+}
+
+/// The main token of a identifier node may not be a identifier token.
+///
+/// Example:
+/// ```zig
+/// const Foo;
+/// @tagName
+/// ```
+/// TODO investigate the parser to figure out why.
+pub fn identifierTokenFromIdentifierNode(tree: Ast, node: Ast.Node.Index) ?Ast.TokenIndex {
+    const main_token = tree.nodes.items(.main_token)[node];
+    if (tree.tokens.items(.tag)[main_token] != .identifier) return null;
+    return main_token;
+}
+
 pub fn hasInferredError(tree: Ast, fn_proto: Ast.full.FnProto) bool {
     const token_tags = tree.tokens.items(.tag);
     if (fn_proto.ast.return_type == 0) return false;
     return token_tags[tree.firstToken(fn_proto.ast.return_type) - 1] == .bang;
 }
 
-pub fn paramFirstToken(tree: Ast, param: Ast.full.FnProto.Param) Ast.TokenIndex {
-    return param.first_doc_comment orelse
+pub fn paramFirstToken(tree: Ast, param: Ast.full.FnProto.Param, include_doc_comment: bool) Ast.TokenIndex {
+    return (if (include_doc_comment) param.first_doc_comment else null) orelse
         param.comptime_noalias orelse
         param.name_token orelse
         tree.firstToken(param.type_expr);
@@ -1133,13 +1173,14 @@ pub fn paramLastToken(tree: Ast, param: Ast.full.FnProto.Param) Ast.TokenIndex {
     return param.anytype_ellipsis3 orelse lastToken(tree, param.type_expr);
 }
 
-pub fn paramSlice(tree: Ast, param: Ast.full.FnProto.Param) []const u8 {
-    const first_token = paramFirstToken(tree, param);
+pub fn paramLoc(tree: Ast, param: Ast.full.FnProto.Param, include_doc_comment: bool) offsets.Loc {
+    const first_token = paramFirstToken(tree, param, include_doc_comment);
     const last_token = paramLastToken(tree, param);
+    return offsets.tokensToLoc(tree, first_token, last_token);
+}
 
-    const start = offsets.tokenToIndex(tree, first_token);
-    const end = offsets.tokenToLoc(tree, last_token).end;
-    return tree.source[start..end];
+pub fn paramSlice(tree: Ast, param: Ast.full.FnProto.Param, include_doc_comment: bool) []const u8 {
+    return offsets.locToSlice(tree.source, paramLoc(tree, param, include_doc_comment));
 }
 
 pub fn isTaggedUnion(tree: Ast, node: Ast.Node.Index) bool {
@@ -1209,6 +1250,18 @@ pub fn builtinCallParams(tree: Ast, node: Ast.Node.Index, buf: *[2]Ast.Node.Inde
     };
 }
 
+pub fn blockLabel(tree: Ast, node: Ast.Node.Index) ?Ast.TokenIndex {
+    const token_tags = tree.tokens.items(.tag);
+    const main_tokens = tree.nodes.items(.main_token);
+
+    const main_token = main_tokens[node];
+
+    if (main_token < 2) return null;
+    if (token_tags[main_token - 1] != .colon) return null;
+    if (token_tags[main_token - 2] != .identifier) return null;
+    return main_token - 2;
+}
+
 /// returns a list of statements
 pub fn blockStatements(tree: Ast, node: Ast.Node.Index, buf: *[2]Ast.Node.Index) ?[]const Node.Index {
     const node_data = tree.nodes.items(.data);
@@ -1229,6 +1282,47 @@ pub fn blockStatements(tree: Ast, node: Ast.Node.Index, buf: *[2]Ast.Node.Index)
         => tree.extra_data[node_data[node].lhs..node_data[node].rhs],
         else => return null,
     };
+}
+
+pub const ErrorSetIterator = struct {
+    token_tags: []const std.zig.Token.Tag,
+    current_token: Ast.TokenIndex,
+    last_token: Ast.TokenIndex,
+
+    pub fn init(tree: Ast, node: Ast.Node.Index) ErrorSetIterator {
+        std.debug.assert(tree.nodes.items(.tag)[node] == .error_set_decl);
+        return .{
+            .token_tags = tree.tokens.items(.tag),
+            .current_token = tree.nodes.items(.main_token)[node] + 2,
+            .last_token = tree.nodes.items(.data)[node].rhs,
+        };
+    }
+
+    pub fn next(it: *ErrorSetIterator) ?Ast.TokenIndex {
+        for (it.token_tags[it.current_token..it.last_token], it.current_token..) |tag, token| {
+            switch (tag) {
+                .doc_comment, .comma => {},
+                .identifier => {
+                    it.current_token = @min(token + 1, it.last_token);
+                    return @intCast(token);
+                },
+                else => {},
+            }
+        }
+        return null;
+    }
+};
+
+pub fn errorSetFieldCount(tree: Ast, node: Ast.Node.Index) usize {
+    std.debug.assert(tree.nodes.items(.tag)[node] == .error_set_decl);
+    const token_tags = tree.tokens.items(.tag);
+    const start = tree.nodes.items(.main_token)[node] + 2;
+    const end = tree.nodes.items(.data)[node].rhs;
+    var count: usize = 0;
+    for (token_tags[start..end]) |tag| {
+        count += @intFromBool(tag == .identifier);
+    }
+    return count;
 }
 
 /// Iterates over FnProto Params w/ added bounds check to support incomplete ast nodes
@@ -1258,7 +1352,7 @@ pub fn nextFnParam(it: *Ast.full.FnProto.Iterator) ?Ast.full.FnProto.Param {
             // #boundsCheck
             // https://github.com/zigtools/zls/issues/567
             if (last_param_type_token >= it.tree.tokens.len - 1)
-                return Ast.full.FnProto.Param{
+                return .{
                     .first_doc_comment = first_doc_comment,
                     .comptime_noalias = comptime_noalias,
                     .name_token = name_token,
@@ -1271,7 +1365,7 @@ pub fn nextFnParam(it: *Ast.full.FnProto.Iterator) ?Ast.full.FnProto.Param {
                 it.tok_i += 1;
             }
             it.tok_flag = true;
-            return Ast.full.FnProto.Param{
+            return .{
                 .first_doc_comment = first_doc_comment,
                 .comptime_noalias = comptime_noalias,
                 .name_token = name_token,
@@ -1294,7 +1388,7 @@ pub fn nextFnParam(it: *Ast.full.FnProto.Iterator) ?Ast.full.FnProto.Param {
         switch (token_tags[it.tok_i]) {
             .ellipsis3 => {
                 it.tok_flag = false; // Next iteration should return null.
-                return Ast.full.FnProto.Param{
+                return .{
                     .first_doc_comment = first_doc_comment,
                     .comptime_noalias = null,
                     .name_token = null,
@@ -1316,7 +1410,7 @@ pub fn nextFnParam(it: *Ast.full.FnProto.Iterator) ?Ast.full.FnProto.Param {
         }
         if (token_tags[it.tok_i] == .keyword_anytype) {
             it.tok_i += 1;
-            return Ast.full.FnProto.Param{
+            return .{
                 .first_doc_comment = first_doc_comment,
                 .comptime_noalias = comptime_noalias,
                 .name_token = name_token,
@@ -1478,7 +1572,12 @@ fn iterateChildrenTypeErased(
             try callback(context, tree, node_data[node].rhs);
         },
 
-        .root,
+        .root => {
+            for (tree.rootDecls()) |child| {
+                try callback(context, tree, child);
+            }
+        },
+
         .array_init_dot,
         .array_init_dot_comma,
         .struct_init_dot,
@@ -1753,17 +1852,18 @@ pub fn iterateChildrenRecursive(
 /// caller owns the returned memory
 pub fn nodeChildrenAlloc(allocator: std.mem.Allocator, tree: Ast, node: Ast.Node.Index) error{OutOfMemory}![]Ast.Node.Index {
     const Context = struct {
-        children: *std.ArrayList(Ast.Node.Index),
+        allocator: std.mem.Allocator,
+        children: *std.ArrayListUnmanaged(Ast.Node.Index),
         fn callback(self: @This(), ast: Ast, child_node: Ast.Node.Index) error{OutOfMemory}!void {
             _ = ast;
             if (child_node == 0) return;
-            try self.children.append(child_node);
+            try self.children.append(self.allocator, child_node);
         }
     };
 
-    var children = std.ArrayList(Ast.Node.Index).init(allocator);
+    var children: std.ArrayListUnmanaged(Ast.Node.Index) = .empty;
     errdefer children.deinit();
-    try iterateChildren(tree, node, Context{ .children = &children }, error{OutOfMemory}, Context.callback);
+    try iterateChildren(tree, node, Context{ .allocator = allocator, .children = &children }, error{OutOfMemory}, Context.callback);
     return children.toOwnedSlice();
 }
 
@@ -1772,17 +1872,18 @@ pub fn nodeChildrenAlloc(allocator: std.mem.Allocator, tree: Ast, node: Ast.Node
 /// caller owns the returned memory
 pub fn nodeChildrenRecursiveAlloc(allocator: std.mem.Allocator, tree: Ast, node: Ast.Node.Index) error{OutOfMemory}![]Ast.Node.Index {
     const Context = struct {
-        children: *std.ArrayList(Ast.Node.Index),
+        allocator: std.mem.Allocator,
+        children: *std.ArrayListUnmanaged(Ast.Node.Index),
         fn callback(self: @This(), ast: Ast, child_node: Ast.Node.Index) error{OutOfMemory}!void {
             _ = ast;
             if (child_node == 0) return;
-            try self.children.append(child_node);
+            try self.children.append(self.allocator, child_node);
         }
     };
 
-    var children = std.ArrayList(Ast.Node.Index).init(allocator);
+    var children: std.ArrayListUnmanaged(Ast.Node.Index) = .empty;
     errdefer children.deinit();
-    try iterateChildrenRecursive(tree, node, .{ .children = &children }, Context.callback);
+    try iterateChildrenRecursive(tree, node, .{ .allocator = allocator, .children = &children }, Context.callback);
     return children.toOwnedSlice(allocator);
 }
 
@@ -1795,7 +1896,7 @@ pub fn nodesOverlappingIndex(allocator: std.mem.Allocator, tree: Ast, index: usi
     const Context = struct {
         index: usize,
         allocator: std.mem.Allocator,
-        nodes: std.ArrayListUnmanaged(Ast.Node.Index) = .{},
+        nodes: std.ArrayListUnmanaged(Ast.Node.Index) = .empty,
 
         pub fn append(self: *@This(), ast: Ast, node: Ast.Node.Index) error{OutOfMemory}!void {
             if (node == 0) return;
@@ -1820,8 +1921,8 @@ pub fn nodesAtLoc(allocator: std.mem.Allocator, tree: Ast, loc: offsets.Loc) err
 
     const Context = struct {
         allocator: std.mem.Allocator,
-        nodes: std.ArrayListUnmanaged(Ast.Node.Index) = .{},
-        locs: std.ArrayListUnmanaged(offsets.Loc) = .{},
+        nodes: std.ArrayListUnmanaged(Ast.Node.Index) = .empty,
+        locs: std.ArrayListUnmanaged(offsets.Loc) = .empty,
 
         pub fn append(self: *@This(), ast: Ast, node: Ast.Node.Index) !void {
             if (node == 0) return;
@@ -1907,4 +2008,68 @@ pub fn smallestEnclosingSubrange(children: []const offsets.Loc, loc: offsets.Loc
         .start = start,
         .len = end - start,
     };
+}
+
+test smallestEnclosingSubrange {
+    const children = &[_]offsets.Loc{
+        .{ .start = 0, .end = 5 },
+        .{ .start = 5, .end = 10 },
+        .{ .start = 12, .end = 18 },
+        .{ .start = 18, .end = 22 },
+        .{ .start = 25, .end = 28 },
+    };
+
+    try std.testing.expect(smallestEnclosingSubrange(&.{}, undefined) == null);
+
+    // children  <-->
+    // loc       <--->
+    // result    null
+    try std.testing.expect(
+        smallestEnclosingSubrange(&.{.{ .start = 0, .end = 4 }}, .{ .start = 0, .end = 5 }) == null,
+    );
+
+    // children  <---><--->  <----><-->   <->
+    // loc       <---------------------------->
+    // result    null
+    try std.testing.expect(smallestEnclosingSubrange(children, .{ .start = 0, .end = 30 }) == null);
+
+    // children  <---><--->  <----><-->   <->
+    // loc             <--------->
+    // result         <--->  <---->
+    const result1 = smallestEnclosingSubrange(children, .{ .start = 6, .end = 17 }).?;
+    try std.testing.expectEqualSlices(
+        offsets.Loc,
+        children[1..3],
+        children[result1.start .. result1.start + result1.len],
+    );
+
+    // children  <---><--->  <----><-->   <->
+    // loc            <------------->
+    // result         <--->  <----><-->
+    const result2 = smallestEnclosingSubrange(children, .{ .start = 6, .end = 20 }).?;
+    try std.testing.expectEqualSlices(
+        offsets.Loc,
+        children[1..4],
+        children[result2.start .. result2.start + result2.len],
+    );
+
+    // children  <---><--->  <----><-->   <->
+    // loc                 <----------->
+    // result         <--->  <----><-->   <->
+    const result3 = smallestEnclosingSubrange(children, .{ .start = 10, .end = 23 }).?;
+    try std.testing.expectEqualSlices(
+        offsets.Loc,
+        children[1..5],
+        children[result3.start .. result3.start + result3.len],
+    );
+
+    // children  <---><--->  <----><-->   <->
+    // loc                 <>
+    // result         <--->  <---->
+    const result4 = smallestEnclosingSubrange(children, .{ .start = 10, .end = 12 }).?;
+    try std.testing.expectEqualSlices(
+        offsets.Loc,
+        children[1..3],
+        children[result4.start .. result4.start + result4.len],
+    );
 }

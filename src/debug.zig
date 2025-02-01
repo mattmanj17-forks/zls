@@ -1,6 +1,7 @@
+//! A set of helper functions that assist in debugging.
+
 const std = @import("std");
 
-const analysis = @import("analysis.zig");
 const offsets = @import("offsets.zig");
 const DocumentScope = @import("DocumentScope.zig");
 
@@ -8,9 +9,9 @@ pub fn printTree(tree: std.zig.Ast) void {
     if (!std.debug.runtime_safety) @compileError("this function should only be used in debug mode!");
 
     std.debug.print(
-        \\
-        \\nodes   tag                  lhs rhs token
-        \\-----------------------------------------------
+        \\printTree:
+        \\nodes   tag                  lhs         rhs         token
+        \\-----------------------------------------------------------
         \\
     , .{});
     for (
@@ -20,7 +21,7 @@ pub fn printTree(tree: std.zig.Ast) void {
         0..,
     ) |tag, data, main_token, i| {
         std.debug.print(
-            "    {d:<3} {s:<20} {d:<3} {d:<3} {d:<3} {s}\n",
+            "    {d:<3} {s:<20} {d:<11} {d:<11} {d:<5} {s}\n",
             .{ i, @tagName(tag), data.lhs, data.rhs, main_token, offsets.tokenToSlice(tree, main_token) },
         );
     }
@@ -76,19 +77,16 @@ pub fn printDocumentScope(doc_scope: DocumentScope) void {
 
 pub const FailingAllocator = struct {
     internal_allocator: std.mem.Allocator,
-    random: std.rand.DefaultPrng,
+    random: std.Random.DefaultPrng,
     likelihood: u32,
 
     /// the chance that an allocation will fail is `1/likelihood`
     /// `likelihood == 0` means that every allocation will fail
     /// `likelihood == std.math.intMax(u32)` means that no allocation will be forced to fail
     pub fn init(internal_allocator: std.mem.Allocator, likelihood: u32) FailingAllocator {
-        var seed = std.mem.zeroes([8]u8);
-        std.os.getrandom(&seed) catch {};
-
-        return FailingAllocator{
+        return .{
             .internal_allocator = internal_allocator,
-            .random = std.rand.DefaultPrng.init(@bitCast(seed)),
+            .random = .init(std.crypto.random.int(u64)),
             .likelihood = likelihood,
         };
     }

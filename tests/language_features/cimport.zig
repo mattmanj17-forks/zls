@@ -25,13 +25,13 @@ test "zig compile server - translate c" {
     try std.testing.expect(result2 == .failure);
 }
 
-test "convertCInclude - empty" {
+test "empty" {
     try testConvertCInclude("@cImport()", "");
     try testConvertCInclude("@cImport({})", "");
     try testConvertCInclude("@cImport({{}, {}})", "");
 }
 
-test "convertCInclude - cInclude" {
+test "cInclude" {
     try testConvertCInclude(
         \\@cImport(@cInclude("foo.zig"))
     ,
@@ -46,7 +46,7 @@ test "convertCInclude - cInclude" {
     );
 }
 
-test "convertCInclude - cDefine" {
+test "cDefine" {
     try testConvertCInclude(
         \\@cImport(@cDefine("FOO", "BAR"))
     ,
@@ -59,7 +59,7 @@ test "convertCInclude - cDefine" {
     );
 }
 
-test "convertCInclude - cUndef" {
+test "cUndef" {
     try testConvertCInclude(
         \\@cImport(@cUndef("FOO"))
     ,
@@ -71,7 +71,7 @@ fn testConvertCInclude(cimport_source: []const u8, expected: []const u8) !void {
     const source: [:0]u8 = try std.fmt.allocPrintZ(allocator, "const c = {s};", .{cimport_source});
     defer allocator.free(source);
 
-    var tree = try Ast.parse(allocator, source, .zig);
+    var tree: Ast = try .parse(allocator, source, .zig);
     defer tree.deinit(allocator);
 
     const node_tags = tree.nodes.items(.tag);
@@ -106,16 +106,24 @@ fn testConvertCInclude(cimport_source: []const u8, expected: []const u8) !void {
 fn testTranslate(c_source: []const u8) !translate_c.Result {
     if (!std.process.can_spawn) return error.SkipZigTest;
 
-    var ctx = try Context.init();
+    var ctx: Context = try .init();
     defer ctx.deinit();
 
-    const result = (try translate_c.translate(allocator, ctx.server.config, &.{}, c_source)).?;
+    var result = (try translate_c.translate(
+        allocator,
+        zls.DocumentStore.Config.fromMainConfig(ctx.server.config),
+        &.{},
+        &.{},
+        c_source,
+    )).?;
+    errdefer result.deinit(allocator);
 
     switch (result) {
         .success => |uri| {
             const path = try zls.URI.parse(allocator, uri);
             defer allocator.free(path);
             try std.testing.expect(std.fs.path.isAbsolute(path));
+            try std.fs.accessAbsolute(path, .{});
         },
         .failure => |message| {
             try std.testing.expect(message.errorMessageCount() != 0);
