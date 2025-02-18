@@ -8,28 +8,26 @@ on:
     paths:
       - ".github/workflows/build_runner.yml"
       - "src/build_runner/**"
-  schedule:
-    - cron: "0 0 * * *"
+      # Ensure that the build runner checks get run when the minimum Zig version gets modified
+      - "build.zig"
+      - "build.zig.zon"
   workflow_dispatch:
 
 jobs:
   check_build_runner:
-    if: github.repository_owner == 'zigtools'
     strategy:
+      fail-fast: false
       matrix:
         include:
-          - zig-version: master
-            zig-init: init
-          - zig-version: 0.11.0
-            zig-init: init-exe
-    runs-on: ubuntu-latest
+          - zig-version: mach-latest
+            build-runner-file: master.zig
+          # Zig master is handled by 'zig build test' in the main CI
+    runs-on: ubuntu-22.04
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Grab zig
-        uses: goto-bus-stop/setup-zig@v2
+      - uses: mlugg/setup-zig@v1
         with:
           version: ${{ matrix.zig-version }}
 
@@ -37,9 +35,9 @@ jobs:
         run: |
           mkdir $RUNNER_TEMP/TEMP_ZIG_PROJECT
           cd $RUNNER_TEMP/TEMP_ZIG_PROJECT
-          zig ${{ matrix.zig-init }}
+          zig init
 
       - name: Check build_runner builds
         run: |
           cd $RUNNER_TEMP/TEMP_ZIG_PROJECT
-          zig build --build-runner $GITHUB_WORKSPACE/src/build_runner/${{ matrix.zig-version }}*.zig
+          zig build --build-runner $GITHUB_WORKSPACE/src/build_runner/${{ matrix.build-runner-file }}

@@ -8,7 +8,7 @@ const offsets = zls.offsets;
 const ErrorBuilder = @This();
 
 allocator: std.mem.Allocator,
-files: std.StringArrayHashMapUnmanaged(File) = .{},
+files: std.StringArrayHashMapUnmanaged(File) = .empty,
 message_count: usize = 0,
 /// similar to `git diff --unified`
 /// show error messages with n lines of context.
@@ -21,7 +21,7 @@ file_name_visibility: enum {
 } = .multi_file,
 
 pub fn init(allocator: std.mem.Allocator) ErrorBuilder {
-    return ErrorBuilder{ .allocator = allocator };
+    return .{ .allocator = allocator };
 }
 
 pub fn deinit(builder: *ErrorBuilder) void {
@@ -219,7 +219,7 @@ fn write(context: FormatContext, writer: anytype) @TypeOf(writer).Error!void {
             try writer.print("{s}:\n", .{file_name});
         }
 
-        var it = MsgItemIterator{
+        var it: MsgItemIterator = .{
             .source = file.source,
             .messages = file.messages.items,
         };
@@ -234,10 +234,10 @@ fn write(context: FormatContext, writer: anytype) @TypeOf(writer).Error!void {
             const line_loc = offsets.lineLocAtIndex(file.source, some_line_source_index);
             defer last_line_end = line_loc.end;
 
-            const unified_loc = if (builder.unified) |n|
+            const unified_loc: offsets.Loc = if (builder.unified) |n|
                 offsets.multilineLocAtIndex(file.source, some_line_source_index, n)
             else
-                offsets.Loc{
+                .{
                     .start = 0,
                     .end = file.source.len,
                 };
@@ -283,7 +283,7 @@ fn write(context: FormatContext, writer: anytype) @TypeOf(writer).Error!void {
 
 const File = struct {
     source: []const u8,
-    messages: std.ArrayListUnmanaged(MsgItem) = .{},
+    messages: std.ArrayListUnmanaged(MsgItem) = .empty,
 };
 
 const MsgItem = struct {
@@ -335,7 +335,7 @@ const MsgItemIterator = struct {
 //
 
 test ErrorBuilder {
-    var eb = ErrorBuilder.init(std.testing.allocator);
+    var eb: ErrorBuilder = .init(std.testing.allocator);
     defer eb.deinit();
     try std.testing.expect(!eb.hasMessages());
 
@@ -350,7 +350,7 @@ test ErrorBuilder {
 }
 
 test "ErrorBuilder - write" {
-    var eb = ErrorBuilder.init(std.testing.allocator);
+    var eb: ErrorBuilder = .init(std.testing.allocator);
     defer eb.deinit();
 
     try std.testing.expectFmt("", "{}", .{eb});
@@ -384,11 +384,11 @@ test "ErrorBuilder - write" {
     {
         eb.clearMessages();
         eb.unified = 0;
-        try eb.msgAtLoc("what about equallity?", "", .{ .start = 175, .end = 195 }, .warn, .{});
+        try eb.msgAtLoc("what about equality?", "", .{ .start = 175, .end = 195 }, .warn, .{});
 
         try std.testing.expectFmt(
             \\(whichever is greater), it obtains a difference, or deviation.
-            \\ ^^^^^^^^^^^^^^^^^^^^ warning: what about equallity?
+            \\ ^^^^^^^^^^^^^^^^^^^^ warning: what about equality?
         , "{}", .{eb});
     }
 
@@ -478,7 +478,7 @@ test "ErrorBuilder - write" {
 }
 
 test "ErrorBuilder - write on empty file" {
-    var eb = ErrorBuilder.init(std.testing.allocator);
+    var eb: ErrorBuilder = .init(std.testing.allocator);
     defer eb.deinit();
 
     try eb.addFile("empty.zig", "");

@@ -1,13 +1,17 @@
+//! Implementation of the `translate-c` i.e `@cImport`.
+
 const std = @import("std");
 const zig_builtin = @import("builtin");
-const builtin = @import("builtin");
-const Config = @import("Config.zig");
+const Config = @import("DocumentStore.zig").Config;
 const ast = @import("ast.zig");
 const tracy = @import("tracy");
 const Ast = std.zig.Ast;
 const URI = @import("uri.zig");
-const ZCS = @import("ZigCompileServer.zig");
-const log = std.log.scoped(.zls_translate_c);
+const log = std.log.scoped(.translate_c);
+
+const ZCSTransport = @import("build_runner/shared.zig").Transport;
+const OutMessage = std.zig.Client.Message;
+const InMessage = std.zig.Server.Message;
 
 /// converts a `@cInclude` node into an equivalent c header file
 /// which can then be handed over to `zig translate-c`
@@ -34,35 +38,19 @@ pub fn convertCInclude(allocator: std.mem.Allocator, tree: Ast, node: Ast.Node.I
     std.debug.assert(ast.isBuiltinCall(tree, node));
     std.debug.assert(std.mem.eql(u8, Ast.tokenSlice(tree, main_tokens[node]), "@cImport"));
 
-    var output = std.ArrayListUnmanaged(u8){};
+    var output: std.ArrayListUnmanaged(u8) = .empty;
     errdefer output.deinit(allocator);
 
     var buffer: [2]Ast.Node.Index = undefined;
     for (ast.builtinCallParams(tree, node, &buffer).?) |child| {
-        var stack_allocator = std.heap.stackFallback(512, allocator);
-        try convertCIncludeInternal(allocator, stack_allocator.get(), tree, child, &output);
+        try convertCIncludeInternal(allocator, tree, child, &output);
     }
 
     return output.toOwnedSlice(allocator);
 }
 
-/// HACK self-hosted has not implemented async yet
-fn callConvertCIncludeInternal(allocator: std.mem.Allocator, args: anytype) error{ OutOfMemory, Unsupported }!void {
-    if (zig_builtin.zig_backend == .other or zig_builtin.zig_backend == .stage1) {
-        const FrameSize = @sizeOf(@Frame(convertCIncludeInternal));
-        const child_frame = try allocator.alignedAlloc(u8, std.Target.stack_align, FrameSize);
-        defer allocator.free(child_frame);
-
-        return await @asyncCall(child_frame, {}, convertCIncludeInternal, args);
-    } else {
-        // TODO find a non recursive solution
-        return @call(.auto, convertCIncludeInternal, args);
-    }
-}
-
 fn convertCIncludeInternal(
     allocator: std.mem.Allocator,
-    stack_allocator: std.mem.Allocator,
     tree: Ast,
     node: Ast.Node.Index,
     output: *std.ArrayListUnmanaged(u8),
@@ -75,7 +63,7 @@ fn convertCIncludeInternal(
     var buffer: [2]Ast.Node.Index = undefined;
     if (ast.blockStatements(tree, node, &buffer)) |statements| {
         for (statements) |statement| {
-            try callConvertCIncludeInternal(stack_allocator, .{ allocator, stack_allocator, tree, statement, output });
+            try convertCIncludeInternal(allocator, tree, statement, output);
         }
     } else if (ast.builtinCallParams(tree, node, &buffer)) |params| {
         if (params.len < 1) return;
@@ -130,41 +118,57 @@ pub fn translate(
     allocator: std.mem.Allocator,
     config: Config,
     include_dirs: []const []const u8,
+    c_macros: []const []const u8,
     source: []const u8,
 ) !?Result {
     const tracy_zone = tracy.trace(@src());
     defer tracy_zone.end();
 
-    const file_path = try std.fs.path.join(allocator, &[_][]const u8{ config.global_cache_path.?, "cimport.h" });
+    const zig_exe_path = config.zig_exe_path.?;
+    const zig_lib_path = config.zig_lib_path.?;
+    const global_cache_path = config.global_cache_path.?;
+
+    var random_bytes: [16]u8 = undefined;
+    std.crypto.random.bytes(&random_bytes);
+    var sub_path: [std.fs.base64_encoder.calcSize(16)]u8 = undefined;
+    _ = std.fs.base64_encoder.encode(&sub_path, &random_bytes);
+
+    var global_cache_dir = try std.fs.openDirAbsolute(global_cache_path, .{});
+    defer global_cache_dir.close();
+
+    var sub_dir = try global_cache_dir.makeOpenPath(&sub_path, .{});
+    defer sub_dir.close();
+
+    sub_dir.writeFile(.{
+        .sub_path = "cimport.h",
+        .data = source,
+    }) catch |err| {
+        log.warn("failed to write to '{s}/{s}/cimport.h': {}", .{ global_cache_path, sub_path, err });
+        return null;
+    };
+
+    defer global_cache_dir.deleteTree(&sub_path) catch |err| {
+        log.warn("failed to delete '{s}/{s}': {}", .{ global_cache_path, sub_path, err });
+    };
+
+    const file_path = try std.fs.path.join(allocator, &.{ global_cache_path, &sub_path, "cimport.h" });
     defer allocator.free(file_path);
 
-    var file = std.fs.createFileAbsolute(file_path, .{}) catch |err| {
-        log.warn("failed to create file '{s}': {}", .{ file_path, err });
-        return null;
-    };
-    defer file.close();
-    defer std.fs.deleteFileAbsolute(file_path) catch |err| {
-        log.warn("failed to delete file '{s}': {}", .{ file_path, err });
-    };
-
-    file.writeAll(source) catch |err| {
-        log.warn("failed to write to '{s}': {}", .{ file_path, err });
-        return null;
-    };
-
     const base_args = &[_][]const u8{
-        config.zig_exe_path.?,
+        zig_exe_path,
         "translate-c",
         "--zig-lib-dir",
-        config.zig_lib_path.?,
+        zig_lib_path,
+        "--cache-dir",
+        global_cache_path,
         "--global-cache-dir",
-        config.global_cache_path.?,
+        global_cache_path,
         "-lc",
         "--listen=-",
     };
 
-    const argc = base_args.len + 2 * include_dirs.len + 1;
-    var argv = try std.ArrayListUnmanaged([]const u8).initCapacity(allocator, argc);
+    const argc = base_args.len + 2 * include_dirs.len + c_macros.len + 1;
+    var argv: std.ArrayListUnmanaged([]const u8) = try .initCapacity(allocator, argc);
     defer argv.deinit(allocator);
 
     argv.appendSliceAssumeCapacity(base_args);
@@ -174,85 +178,95 @@ pub fn translate(
         argv.appendAssumeCapacity(include_dir);
     }
 
+    argv.appendSliceAssumeCapacity(c_macros);
+
     argv.appendAssumeCapacity(file_path);
 
-    var process = std.process.Child.init(argv.items, allocator);
+    var process: std.process.Child = .init(argv.items, allocator);
     process.stdin_behavior = .Pipe;
     process.stdout_behavior = .Pipe;
-    process.stderr_behavior = .Pipe;
+    process.stderr_behavior = .Ignore;
 
-    errdefer |err| if (!zig_builtin.is_test) blk: {
-        const joined = std.mem.join(allocator, " ", argv.items) catch break :blk;
-        defer allocator.free(joined);
-        if (process.stderr) |stderr| {
-            const stderr_output = stderr.readToEndAlloc(allocator, std.math.maxInt(usize)) catch break :blk;
-            defer allocator.free(stderr_output);
-            log.err("failed zig translate-c command:\n{s}\nstderr:{s}\nerror:{}\n", .{ joined, stderr_output, err });
-        } else {
-            log.err("failed zig translate-c command:\n{s}\nerror:{}\n", .{ joined, err });
-        }
-    };
+    errdefer |err| if (!zig_builtin.is_test) reportTranslateError(allocator, process.stderr, argv.items, @errorName(err));
 
     process.spawn() catch |err| {
         log.err("failed to spawn zig translate-c process, error: {}", .{err});
         return null;
     };
 
-    defer _ = process.wait() catch |wait_err| blk: {
+    defer _ = process.wait() catch |wait_err| {
         log.err("zig translate-c process did not terminate, error: {}", .{wait_err});
-        break :blk process.kill() catch |kill_err| {
-            std.debug.panic("failed to terminate zig translate-c process, error: {}", .{kill_err});
-        };
     };
 
-    var zcs = ZCS.init(.{
+    var zcs: ZCSTransport = .init(.{
         .gpa = allocator,
         .in = process.stdout.?,
         .out = process.stdin.?,
     });
     defer zcs.deinit();
 
-    try zcs.serveMessage(.{ .tag = .update, .bytes_len = 0 }, &.{});
-    try zcs.serveMessage(.{ .tag = .exit, .bytes_len = 0 }, &.{});
+    try zcs.serveMessage(.{ .tag = @intFromEnum(OutMessage.Tag.update), .bytes_len = 0 }, &.{});
+    try zcs.serveMessage(.{ .tag = @intFromEnum(OutMessage.Tag.exit), .bytes_len = 0 }, &.{});
 
     while (true) {
-        const header = try zcs.receiveMessage();
+        const header = try zcs.receiveMessage(20 * std.time.ns_per_s);
         // log.debug("received header: {}", .{header});
 
-        switch (header.tag) {
+        switch (@as(InMessage.Tag, @enumFromInt(header.tag))) {
             .zig_version => {
                 // log.debug("zig-version: {s}", .{zcs.receive_fifo.readableSliceOfLen(header.bytes_len)});
-                zcs.pooler.fifo(.in).discard(header.bytes_len);
+                zcs.discard(header.bytes_len);
             },
-            .emit_bin_path => {
-                const body_size = @sizeOf(std.zig.Server.Message.EmitBinPath);
-                if (header.bytes_len <= body_size) return error.InvalidResponse;
+            .emit_digest => {
+                const expected_size: usize = @sizeOf(std.zig.Server.Message.EmitDigest) + 16;
+                if (header.bytes_len != expected_size) return error.InvalidResponse;
 
-                _ = try zcs.receiveEmitBinPath();
+                zcs.discard(@sizeOf(InMessage.EmitDigest));
 
-                const trailing_size = header.bytes_len - body_size;
-                const result_path = zcs.pooler.fifo(.in).readableSliceOfLen(trailing_size);
+                const bin_result_path = try zcs.reader().readBytesNoEof(16);
+                const hex_result_path = std.Build.Cache.binToHex(bin_result_path);
+                const result_path = try std.fs.path.join(allocator, &.{ global_cache_path, "o", &hex_result_path, "cimport.zig" });
+                defer allocator.free(result_path);
 
-                return Result{ .success = try URI.fromPath(allocator, std.mem.sliceTo(result_path, '\n')) };
+                return .{ .success = try URI.fromPath(allocator, std.mem.sliceTo(result_path, '\n')) };
             },
             .error_bundle => {
-                const error_bundle_header = try zcs.receiveErrorBundle();
+                if (header.bytes_len < @sizeOf(InMessage.ErrorBundle)) return error.InvalidResponse;
 
-                const extra = try zcs.receiveIntArray(allocator, error_bundle_header.extra_len);
+                const error_bundle_header: InMessage.ErrorBundle = .{
+                    .extra_len = try zcs.reader().readInt(u32, .little),
+                    .string_bytes_len = try zcs.reader().readInt(u32, .little),
+                };
+
+                const expected_size = @sizeOf(InMessage.ErrorBundle) + error_bundle_header.extra_len * @sizeOf(u32) + error_bundle_header.string_bytes_len;
+                if (header.bytes_len != expected_size) return error.InvalidResponse;
+
+                const extra = try zcs.receiveSlice(allocator, u32, error_bundle_header.extra_len);
                 errdefer allocator.free(extra);
 
                 const string_bytes = try zcs.receiveBytes(allocator, error_bundle_header.string_bytes_len);
                 errdefer allocator.free(string_bytes);
 
-                const error_bundle = std.zig.ErrorBundle{ .string_bytes = string_bytes, .extra = extra };
+                const error_bundle: std.zig.ErrorBundle = .{ .string_bytes = string_bytes, .extra = extra };
 
-                return Result{ .failure = error_bundle };
+                return .{ .failure = error_bundle };
             },
             else => {
-                log.warn("received unexpected message {} from zig compile server", .{header.tag});
-                return null;
+                zcs.discard(header.bytes_len);
             },
         }
+    }
+}
+
+fn reportTranslateError(allocator: std.mem.Allocator, stderr: ?std.fs.File, argv: []const []const u8, err_name: []const u8) void {
+    const joined = std.mem.join(allocator, " ", argv) catch return;
+    defer allocator.free(joined);
+    if (stderr) |file| {
+        const stderr_output = file.readToEndAlloc(allocator, 16 * 1024 * 1024) catch return;
+        defer allocator.free(stderr_output);
+        log.err("failed zig translate-c command:\n{s}\nstderr:{s}\nerror:{s}\n", .{ joined, stderr_output, err_name });
+    } else {
+        log.err("failed zig translate-c command:\n{s}\nerror:{s}\n", .{ joined, err_name });
     }
 }
 

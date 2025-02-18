@@ -1,6 +1,5 @@
 const std = @import("std");
 const zls = @import("zls");
-const builtin = @import("builtin");
 
 const helper = @import("../helper.zig");
 const Context = @import("../context.zig").Context;
@@ -11,7 +10,7 @@ const offsets = zls.offsets;
 
 const allocator: std.mem.Allocator = std.testing.allocator;
 
-test "goto - global variable" {
+test "global variable" {
     try testDefinition(
         \\const <def><decl>foo</decl></def> = 5;
         \\comptime {
@@ -30,9 +29,19 @@ test "goto - global variable" {
     try testDefinition(
         \\const <def><decl><>foo</decl></def>: <tdef>u32</tdef> = 5;
     );
+
+    try testDefinition(
+        \\const S = <tdef>struct</tdef> { alpha: u32 };
+        \\const <>s: S  = S{ .alpha = 5 };
+    );
+
+    try testDefinition(
+        \\const S = <tdef>struct</tdef> { alpha: u32 };
+        \\const <>s = S{ .alpha = 5 };
+    );
 }
 
-test "goto - local variable" {
+test "local variable" {
     try testDefinition(
         \\comptime {
         \\    var <def><decl>foo</decl></def> = 5;
@@ -55,17 +64,25 @@ test "goto - local variable" {
     );
 }
 
-test "goto - assign destructure" {
+test "assign destructure" {
     try testDefinition(
-        \\comptime {
+        \\test {
         \\    const foo, const <def><decl>bar</decl></def>: <tdef>u32</tdef> = .{ 1, 2 };
         \\    _ = foo;
         \\    _ = <>bar;
         \\}
     );
+    try testDefinition(
+        \\test {
+        \\    var <def><decl>foo</decl></def>: <tdef>u32</tdef> = undefined;
+        \\    foo, const bar: u32 = .{ 1, 2 };
+        \\    _ = <>foo;
+        \\    _ = bar;
+        \\}
+    );
 }
 
-test "goto - function parameter" {
+test "function parameter" {
     try testDefinition(
         \\fn f(<def><decl>foo</decl></def>: <tdef>u32</tdef>) void {
         \\    _ = <>foo;
@@ -73,7 +90,7 @@ test "goto - function parameter" {
     );
 }
 
-test "goto - field access" {
+test "field access" {
     try testDefinition(
         \\const S = struct { <def><decl>alpha</decl></def>: <tdef>u32</tdef> };
         \\var s: S = undefined;
@@ -81,14 +98,14 @@ test "goto - field access" {
     );
 }
 
-test "goto - struct init" {
+test "struct init" {
     try testDefinition(
         \\const S = struct { <def><decl>alpha</decl></def>: <tdef>u32</tdef> };
         \\var s = S{ .<>alpha = 5};
     );
 }
 
-test "goto - capture" {
+test "capture" {
     try testDefinition(
         \\test {
         \\    const S = <tdef>struct</tdef> {};
@@ -107,7 +124,7 @@ test "goto - capture" {
     );
 }
 
-test "goto - label" {
+test "label" {
     try testDefinition(
         \\comptime {
         \\    <def><decl>blk</decl></def>: {
@@ -117,7 +134,7 @@ test "goto - label" {
     );
 }
 
-test "goto - different cursor position" {
+test "different cursor position" {
     try testDefinition(
         \\const <def><decl>foo</decl></def> = 5;
         \\comptime {
@@ -138,7 +155,7 @@ test "goto - different cursor position" {
     );
 }
 
-test "goto - alias" {
+test "alias" {
     try testDefinition(
         \\const <def>Foo</def> = u32;
         \\const <decl>Bar</decl> = Foo;
@@ -147,7 +164,7 @@ test "goto - alias" {
     );
 }
 
-test "definition - multiline builder pattern" {
+test "multiline builder pattern" {
     try testDefinition(
         \\const Foo = struct {
         \\    fn add(foo: Foo) Foo {}
@@ -168,6 +185,49 @@ test "definition - multiline builder pattern" {
     );
 }
 
+test "block and decl with same name" {
+    try testDefinition(
+        \\const x = <def><decl>x</decl></def>: {
+        \\    const x: u8 = 1;
+        \\    break :<>x x;
+        \\};
+        \\_ = x;
+    );
+    try testDefinition(
+        \\const x = x: {
+        \\    const <def><decl>x</decl></def>: u8 = 1;
+        \\    break :x <>x;
+        \\};
+        \\_ = x;
+    );
+    try testDefinition(
+        \\const <def><decl>x</decl></def> = x: {
+        \\    const x: u8 = 1;
+        \\    break :x x;
+        \\};
+        \\_ = <>x;
+    );
+}
+
+test "non labeled break" {
+    try testDefinition(
+        \\test {
+        \\    while (true) {
+        \\        break {
+        \\            const <def><decl>foo</decl></def> = 5;
+        \\            return foo<>;
+        \\        };
+        \\    }
+        \\}
+    );
+    try testDefinition(
+        \\const <def><decl>num</decl></def>: usize = 5;
+        \\return while (true) {
+        \\    break num<>;
+        \\};
+    );
+}
+
 /// - use `<>` to indicate the cursor position
 /// - use `<decl>content</decl>` to set the expected range of the declaration
 /// - use `<def>content</def>` to set the expected range of the definition
@@ -178,12 +238,12 @@ fn testDefinition(source: []const u8) !void {
     var phr = try helper.collectClearPlaceholders(allocator, source);
     defer phr.deinit(allocator);
 
-    var ctx = try Context.init();
+    var ctx: Context = try .init();
     defer ctx.deinit();
 
-    const test_uri = try ctx.addDocument(phr.new_source);
+    const test_uri = try ctx.addDocument(.{ .source = phr.new_source });
 
-    var error_builder = ErrorBuilder.init(allocator);
+    var error_builder: ErrorBuilder = .init(allocator);
     defer error_builder.deinit();
     errdefer error_builder.writeDebug();
 
@@ -241,9 +301,9 @@ fn testDefinition(source: []const u8) !void {
 
     const cursor_position = offsets.indexToPosition(phr.new_source, cursor_index, ctx.server.offset_encoding);
 
-    const declaration_params = types.DeclarationParams{ .textDocument = .{ .uri = test_uri }, .position = cursor_position };
-    const definition_params = types.DefinitionParams{ .textDocument = .{ .uri = test_uri }, .position = cursor_position };
-    const type_definition_params = types.TypeDefinitionParams{ .textDocument = .{ .uri = test_uri }, .position = cursor_position };
+    const declaration_params: types.DeclarationParams = .{ .textDocument = .{ .uri = test_uri }, .position = cursor_position };
+    const definition_params: types.DefinitionParams = .{ .textDocument = .{ .uri = test_uri }, .position = cursor_position };
+    const type_definition_params: types.TypeDefinitionParams = .{ .textDocument = .{ .uri = test_uri }, .position = cursor_position };
 
     const maybe_declaration_response = if (declaration_loc != null)
         try ctx.server.sendRequestSync(ctx.arena.allocator(), "textDocument/declaration", declaration_params)
@@ -345,7 +405,7 @@ fn parseTaggedLoc(old_source: []const u8, phr: helper.CollectPlaceholdersResult,
 
     if (start.? > end.?) {
         std.debug.print("opening tag of '{s}' is after the closing tag", .{offsets.locToSlice(old_source, old_start_loc.?)});
-        return error.MissmatchedTags;
+        return error.MismatchedTags;
     }
 
     return .{ .start = start.?, .end = end.? };

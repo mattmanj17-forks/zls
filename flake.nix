@@ -1,50 +1,54 @@
 {
   inputs =
     {
-      nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+      nixpkgs.url = "github:NixOS/nixpkgs/nixos-24.11";
 
       zig-overlay.url = "github:mitchellh/zig-overlay";
       zig-overlay.inputs.nixpkgs.follows = "nixpkgs";
 
       gitignore.url = "github:hercules-ci/gitignore.nix";
       gitignore.inputs.nixpkgs.follows = "nixpkgs";
-
-      flake-utils.url = "github:numtide/flake-utils";
-
-      langref.url = "https://raw.githubusercontent.com/ziglang/zig/54bbc73f8502fe073d385361ddb34a43d12eec39/doc/langref.html.in";
-      langref.flake = false;
     };
 
-  outputs = inputs:
-    let
-      inherit (inputs) nixpkgs zig-overlay gitignore flake-utils;
-      systems = [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ];
-      inherit (gitignore.lib) gitignoreSource;
-    in
-    flake-utils.lib.eachSystem systems (system:
+  outputs = { self, nixpkgs, zig-overlay, gitignore }: let
+    inherit (nixpkgs) lib;
+
+    # flake-utils polyfill
+    eachSystem = systems: fn:
+      lib.foldl' (
+        acc: system:
+          lib.recursiveUpdate
+          acc
+          (lib.mapAttrs (_: value: {${system} = value;}) (fn system))
+      ) {}
+      systems;
+
+    systems = ["x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin"];
+  in eachSystem systems (system:
       let
         pkgs = nixpkgs.legacyPackages.${system};
         zig = zig-overlay.packages.${system}.master;
+        gitignoreSource = gitignore.lib.gitignoreSource;
       in
       rec {
-        formatter = nixpkgs.legacyPackages.${system}.nixpkgs-fmt;
+        formatter = pkgs.nixpkgs-fmt;
         packages.default = packages.zls;
         packages.zls = pkgs.stdenvNoCC.mkDerivation {
           name = "zls";
           version = "master";
+          meta.mainProgram = "zls";
           src = gitignoreSource ./.;
           nativeBuildInputs = [ zig ];
           dontConfigure = true;
           dontInstall = true;
           doCheck = true;
-          langref = inputs.langref;
           buildPhase = ''
-            mkdir -p .cache
-            ln -s ${pkgs.callPackage ./deps.nix { }} .cache/p
-            zig build install --cache-dir $(pwd)/zig-cache --global-cache-dir $(pwd)/.cache -Dversion_data_path=$langref -Dcpu=baseline -Doptimize=ReleaseSafe --prefix $out
+            NO_COLOR=1 # prevent escape codes from messing up the `nix log`
+            PACKAGE_DIR=${pkgs.callPackage ./deps.nix { zig = zig; }}
+            zig build install --global-cache-dir $(pwd)/.cache --system $PACKAGE_DIR -Dcpu=baseline -Doptimize=ReleaseSafe --prefix $out
           '';
           checkPhase = ''
-            zig build test --cache-dir $(pwd)/zig-cache --global-cache-dir $(pwd)/.cache -Dversion_data_path=$langref -Dcpu=baseline
+            zig build test --global-cache-dir $(pwd)/.cache --system $PACKAGE_DIR -Dcpu=baseline
           '';
         };
       }

@@ -9,11 +9,11 @@ on:
 jobs:
   coverage:
     if: github.repository_owner == 'zigtools'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
 
-      - uses: goto-bus-stop/setup-zig@v2
+      - uses: mlugg/setup-zig@v1
         with:
           version: master
 
@@ -27,12 +27,11 @@ jobs:
       - name: Run Tests with kcov
         run: |
           kcov --version
-          zig build test -Dgenerate_coverage --summary all
+          zig build test -Dcoverage --summary all
 
       - name: Upload to Codecov
-        uses: codecov/codecov-action@v4
+        uses: codecov/codecov-action@v5
         with:
-          token: ${{ secrets.CODECOV_TOKEN }}
           directory: zig-out/coverage/kcov-merged
           fail_ci_if_error: true
           verbose: true

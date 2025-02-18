@@ -8,7 +8,7 @@ const offsets = zls.offsets;
 
 const allocator: std.mem.Allocator = std.testing.allocator;
 
-test "signature help - no parameters" {
+test "no parameters" {
     try testSignatureHelp(
         \\fn foo() void {
         \\    foo(<cursor>)
@@ -16,7 +16,7 @@ test "signature help - no parameters" {
     , "fn foo() void", null);
 }
 
-test "signature help - simple" {
+test "simple" {
     try testSignatureHelp(
         \\fn foo(a: u32, b: u32) void {
         \\    foo(<cursor>)
@@ -49,7 +49,7 @@ test "signature help - simple" {
     , "fn foo(a: u32, b: u32) void", 1);
 }
 
-test "signature help - syntax error resistance" {
+test "syntax error resistance" {
     try testSignatureHelp(
         \\fn foo(a: u32, b: u32) void {
         \\    foo(<cursor>
@@ -87,7 +87,7 @@ test "signature help - syntax error resistance" {
     , "fn foo(a: u32, b: u32) void", 0);
 }
 
-test "signature help - alias" {
+test "alias" {
     try testSignatureHelp(
         \\fn foo(a: u32, b: u32) void {
         \\    bar(<cursor>)
@@ -102,7 +102,7 @@ test "signature help - alias" {
     , "fn foo(a: u32, b: u32) void", 0);
 }
 
-test "signature help - function pointer" {
+test "function pointer" {
     try testSignatureHelp(
         \\const foo: fn (bool, u32) void = undefined;
         \\comptime {
@@ -123,7 +123,7 @@ test "signature help - function pointer" {
     , "fn (bool, u32) void", 0);
 }
 
-test "signature help - function pointer container field" {
+test "function pointer container field" {
     try testSignatureHelp(
         \\const S = struct {
         \\    foo: fn(a: u32, b: void) bool {}
@@ -147,11 +147,12 @@ test "signature help - function pointer container field" {
     , "fn(a: u32, b: void) bool", 0);
 }
 
-test "signature help - self parameter" {
+test "self parameter" {
     // parameter: S
     // argument: S
     try testSignatureHelp(
         \\const S = struct {
+        \\    alpha: u32,
         \\    fn foo(self: @This(), a: u32, b: void) bool {}
         \\};
         \\const s: S = undefined;
@@ -159,6 +160,7 @@ test "signature help - self parameter" {
     , "fn foo(self: @This(), a: u32, b: void) bool", 2);
     try testSignatureHelp(
         \\const S = struct {
+        \\    alpha: u32,
         \\    fn foo(self: @This(), a: u32, b: void) bool {}
         \\};
         \\const foo = S.foo(undefined,<cursor>);
@@ -168,6 +170,7 @@ test "signature help - self parameter" {
     // argument: S
     try testSignatureHelp(
         \\const S = struct {
+        \\    alpha: u32,
         \\    fn foo(self: *@This(), a: u32, b: void) bool {}
         \\};
         \\const s: S = undefined;
@@ -175,6 +178,7 @@ test "signature help - self parameter" {
     , "fn foo(self: *@This(), a: u32, b: void) bool", 2);
     try testSignatureHelp(
         \\const S = struct {
+        \\    alpha: u32,
         \\    fn foo(self: *@This(), a: u32, b: void) bool {}
         \\};
         \\const foo = S.foo(undefined,<cursor>);
@@ -184,6 +188,7 @@ test "signature help - self parameter" {
     // argument: *S
     try testSignatureHelp(
         \\const S = struct {
+        \\    alpha: u32,
         \\    fn foo(self: @This(), a: u32, b: void) bool {}
         \\};
         \\const s: *S = undefined;
@@ -194,6 +199,7 @@ test "signature help - self parameter" {
     // argument: *S
     try testSignatureHelp(
         \\const S = struct {
+        \\    alpha: u32,
         \\    fn foo(self: *@This(), a: u32, b: void) bool {}
         \\};
         \\const s: *S = undefined;
@@ -201,9 +207,10 @@ test "signature help - self parameter" {
     , "fn foo(self: *@This(), a: u32, b: void) bool", 2);
 }
 
-test "signature help - self parameter is anytype" {
+test "self parameter is anytype" {
     try testSignatureHelp(
         \\const S = struct {
+        \\    alpha: u32,
         \\    fn foo(self: anytype, a: u32, b: void) bool {}
         \\};
         \\const s: S = undefined;
@@ -211,7 +218,7 @@ test "signature help - self parameter is anytype" {
     , "fn foo(self: anytype, a: u32, b: void) bool", 2);
 }
 
-test "signature help - anytype" {
+test "anytype" {
     try testSignatureHelp(
         \\fn foo(a: u32, b: anytype, c: u32) void {
         \\    foo(1,<cursor>,2)
@@ -219,7 +226,7 @@ test "signature help - anytype" {
     , "fn foo(a: u32, b: anytype, c: u32) void", 1);
 }
 
-test "signature help - nested function call" {
+test "nested function call" {
     try testSignatureHelp(
         \\fn foo(a: u32, b: u32) i32 {
         \\    foo(1, bar(<cursor>));
@@ -228,7 +235,18 @@ test "signature help - nested function call" {
     , "fn bar(c: bool) bool", 0);
 }
 
-test "signature help - builtin" {
+test "decl literal" {
+    try testSignatureHelp(
+        \\const S = struct {
+        \\    fn foo(a: u32, b: u32) S {}
+        \\};
+        \\test {
+        \\    const s: S = .foo(<cursor>);
+        \\}
+    , "fn foo(a: u32, b: u32) S", 0);
+}
+
+test "builtin" {
     try testSignatureHelp(
         \\test {
         \\    @panic(<cursor>)
@@ -251,12 +269,12 @@ fn testSignatureHelp(source: []const u8, expected_label: []const u8, expected_ac
     const text = try std.mem.concat(allocator, u8, &.{ source[0..cursor_idx], source[cursor_idx + "<cursor>".len ..] });
     defer allocator.free(text);
 
-    var ctx = try Context.init();
+    var ctx: Context = try .init();
     defer ctx.deinit();
 
-    const test_uri = try ctx.addDocument(text);
+    const test_uri = try ctx.addDocument(.{ .source = text });
 
-    const params = types.SignatureHelpParams{
+    const params: types.SignatureHelpParams = .{
         .textDocument = .{ .uri = test_uri },
         .position = offsets.indexToPosition(text, cursor_idx, ctx.server.offset_encoding),
     };

@@ -1,6 +1,5 @@
 const std = @import("std");
 const zls = @import("zls");
-const builtin = @import("builtin");
 
 const helper = @import("../helper.zig");
 const Context = @import("../context.zig").Context;
@@ -42,7 +41,7 @@ test "references" {
     );
 }
 
-test "references - global scope" {
+test "global scope" {
     try testReferences(
         \\const foo = <0>;
         \\const <0> = 0;
@@ -50,7 +49,7 @@ test "references - global scope" {
     );
 }
 
-test "references - local scope" {
+test "local scope" {
     try testReferences(
         \\fn foo(<0>: u32, bar: u32) void {
         \\    return <0> + bar;
@@ -69,7 +68,7 @@ test "references - local scope" {
     );
 }
 
-test "references - destructuring" {
+test "destructuring" {
     try testReferences(
         \\const blk = {
         \\    const <0>, const foo = .{ 1, 2 };
@@ -84,7 +83,7 @@ test "references - destructuring" {
     );
 }
 
-test "references - for/while capture" {
+test "for/while capture" {
     try testReferences(
         \\const blk = {
         \\    for ("") |<0>| {
@@ -97,7 +96,17 @@ test "references - for/while capture" {
     );
 }
 
-test "references - struct field access" {
+test "enum field access" {
+    try testReferences(
+        \\const E = enum {
+        \\  <0>,
+        \\  bar
+        \\};
+        \\const e = E.<0>;
+    );
+}
+
+test "struct field access" {
     try testReferences(
         \\const S = struct {<0>: u32 = 3};
         \\pub fn foo() bool {
@@ -107,7 +116,7 @@ test "references - struct field access" {
     );
 }
 
-test "references - struct decl access" {
+test "struct decl access" {
     try testReferences(
         \\const S = struct {
         \\    fn <0>() void {}
@@ -122,7 +131,21 @@ test "references - struct decl access" {
     );
 }
 
-test "references - while continue expression" {
+test "struct one field init" {
+    try testReferences(
+        \\const S = struct {<0>: u32};
+        \\const s = S{.<0> = 0 };
+    );
+}
+
+test "struct multi-field init" {
+    try testReferences(
+        \\const S = struct {<0>: u32, a: bool};
+        \\const s = S{.<0> = 0, .a = true};
+    );
+}
+
+test "while continue expression" {
     try testReferences(
         \\ pub fn foo() void {
         \\     var <0>: u32 = 0;
@@ -131,23 +154,31 @@ test "references - while continue expression" {
     );
 }
 
-test "references - test with identifier" {
+test "test with identifier" {
     try testReferences(
         \\pub fn <0>() bool {}
         \\test <0> {}
+        \\test "placeholder" {}
         \\test {}
     );
 }
 
-test "references - label" {
+test "label" {
     try testReferences(
         \\const foo = <0>: {
         \\    break :<0> 0;
         \\};
     );
+    try testReferences(
+        \\const foo = <0>: {
+        \\    const <1> = 0;
+        \\    _ = <1>;
+        \\    break :<0> 0;
+        \\};
+    );
 }
 
-test "references - asm" {
+test "asm" {
     try testReferences(
         \\fn foo(<0>: u32) void {
         \\    asm ("bogus"
@@ -165,7 +196,7 @@ test "references - asm" {
     );
 }
 
-test "references - function header" {
+test "function header" {
     try testReferences(
         \\fn foo(<0>: anytype) @TypeOf(<0>) {}
     );
@@ -174,7 +205,7 @@ test "references - function header" {
     );
 }
 
-test "references - cross-file reference" {
+test "cross-file reference" {
     if (true) return error.SkipZigTest; // TODO
     try testMFReferences(&.{
         \\pub const <0> = struct {};
@@ -192,19 +223,19 @@ fn testReferences(source: []const u8) !void {
 fn testMFReferences(sources: []const []const u8) !void {
     const placeholder_name = "placeholder";
 
-    var ctx = try Context.init();
+    var ctx: Context = try .init();
     defer ctx.deinit();
 
     const File = struct { source: []const u8, new_source: []const u8 };
     const LocPair = struct { file_index: usize, old: offsets.Loc, new: offsets.Loc };
 
-    var files = std.StringArrayHashMapUnmanaged(File){};
+    var files: std.StringArrayHashMapUnmanaged(File) = .empty;
     defer {
         for (files.values()) |file| allocator.free(file.new_source);
         files.deinit(allocator);
     }
 
-    var loc_set: std.StringArrayHashMapUnmanaged(std.MultiArrayList(LocPair)) = .{};
+    var loc_set: std.StringArrayHashMapUnmanaged(std.MultiArrayList(LocPair)) = .empty;
     defer {
         for (loc_set.values()) |*locs| locs.deinit(allocator);
         loc_set.deinit(allocator);
@@ -215,7 +246,7 @@ fn testMFReferences(sources: []const []const u8) !void {
         var phr = try helper.collectReplacePlaceholders(allocator, source, placeholder_name);
         defer phr.deinit(allocator);
 
-        const uri = try ctx.addDocument(phr.new_source);
+        const uri = try ctx.addDocument(.{ .source = phr.new_source });
         files.putAssumeCapacityNoClobber(uri, .{ .source = source, .new_source = phr.new_source });
         phr.new_source = ""; // `files` takes ownership of `new_source` from `phr`
 
@@ -226,7 +257,7 @@ fn testMFReferences(sources: []const []const u8) !void {
         }
     }
 
-    var error_builder = ErrorBuilder.init(allocator);
+    var error_builder: ErrorBuilder = .init(allocator);
     defer error_builder.deinit();
     errdefer error_builder.writeDebug();
 
@@ -242,7 +273,7 @@ fn testMFReferences(sources: []const []const u8) !void {
             const file_uri = files.keys()[file_index];
 
             const middle = new_loc.start + (new_loc.end - new_loc.start) / 2;
-            const params = types.ReferenceParams{
+            const params: types.ReferenceParams = .{
                 .textDocument = .{ .uri = file_uri },
                 .position = offsets.indexToPosition(file.new_source, middle, ctx.server.offset_encoding),
                 .context = .{ .includeDeclaration = true },
@@ -258,7 +289,7 @@ fn testMFReferences(sources: []const []const u8) !void {
 
             // keeps track of expected locations that have been given by the server
             // used to detect double references and missing references
-            var visited = try std.DynamicBitSetUnmanaged.initEmpty(allocator, locs.len);
+            var visited: std.DynamicBitSetUnmanaged = try .initEmpty(allocator, locs.len);
             defer visited.deinit(allocator);
 
             for (actual_locations) |response_location| {

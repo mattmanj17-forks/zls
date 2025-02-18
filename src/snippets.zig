@@ -1,4 +1,6 @@
-const types = @import("lsp.zig");
+//! Collection of all snippets and keywords.
+
+const types = @import("lsp").types;
 
 pub const Snipped = struct {
     label: []const u8,
@@ -8,6 +10,7 @@ pub const Snipped = struct {
 
 pub const top_level_decl_data = [_]Snipped{
     .{ .label = "std", .kind = .Snippet, .text = "const std = @import(\"std\");" },
+    .{ .label = "root", .kind = .Snippet, .text = "const root = @import(\"root\");" },
     .{ .label = "import", .kind = .Snippet, .text = "const $1 = @import(\"$2\")" },
     .{ .label = "fn", .kind = .Snippet, .text = "fn ${1:name}($2) ${3:!void} {$0}" },
     .{ .label = "pub fn", .kind = .Snippet, .text = "pub fn ${1:name}($2) ${3:!void} {$0}" },
@@ -18,6 +21,14 @@ pub const top_level_decl_data = [_]Snipped{
     .{ .label = "union tagged", .kind = .Snippet, .text = "const $1 = union(${2:enum}) {$0};" },
     .{ .label = "test", .kind = .Snippet, .text = "test \"$1\" {$0}" },
     .{ .label = "main", .kind = .Snippet, .text = "pub fn main() !void {$0}" },
+    .{ .label = "std_options", .kind = .Snippet, .text = "pub const std_options: std.Options = .{$0};" },
+    .{ .label = "panic", .kind = .Snippet, .text = 
+    \\pub fn panic(
+    \\    msg: []const u8,
+    \\    trace: ?*std.builtin.StackTrace,
+    \\    ret_addr: ?usize,
+    \\) noreturn {$0}
+    },
 };
 
 pub const generic = [_]Snipped{
@@ -76,12 +87,19 @@ pub const generic = [_]Snipped{
     .{ .label = "catch switch", .kind = .Snippet, .text = "catch |${1:err}| switch (${1:err}) {$0};" },
 
     // snippets
-    .{ .label = "main", .kind = .Snippet, .text = "pub fn main() !void {$0}" },
     .{ .label = "print", .kind = .Snippet, .text = "std.debug.print(\"$1\", .{$0});" },
     .{ .label = "log err", .kind = .Snippet, .text = "std.log.err(\"$1\", .{$0});" },
     .{ .label = "log warn", .kind = .Snippet, .text = "std.log.warn(\"$1\", .{$0});" },
     .{ .label = "log info", .kind = .Snippet, .text = "std.log.info(\"$1\", .{$0});" },
     .{ .label = "log debug", .kind = .Snippet, .text = "std.log.debug(\"$1\", .{$0});" },
+    .{ .label = "format", .kind = .Snippet, .text = 
+    \\pub fn format(
+    \\    ${1:self}: ${2:@This()},
+    \\    comptime fmt: []const u8,
+    \\    options: std.fmt.FormatOptions,
+    \\    writer: anytype,
+    \\) !void {$0}
+    },
 
     // types
     .{ .label = "anyerror", .kind = .Keyword },
