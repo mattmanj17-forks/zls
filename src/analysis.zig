@@ -1092,21 +1092,32 @@ pub fn resolveDerefBinding(analyser: *Analyser, pointer: Type) error{OutOfMemory
 pub const BracketAccess = union(enum) {
     /// `lhs[index]`
     single: ?u64,
-    /// `lhs[start..]`
-    open: ?u64,
-    /// `lhs[start..end]`
-    range: ?struct { u64, u64 },
+    /// `lhs[start.. :sentinel]`
+    open: struct {
+        start: ?u64,
+        sentinel: ?InternPool.Index,
+    },
+    /// `lhs[start..end :sentinel]`
+    range: struct {
+        bounds: ?struct { u64, u64 },
+        sentinel: ?InternPool.Index,
+    },
 
     pub fn fromSlice(
         analyser: *Analyser,
         handle: *DocumentStore.Handle,
-        start_node: Ast.Node.Index,
-        end_node_maybe: ?Ast.Node.Index,
+        slice: Ast.full.Slice,
     ) error{OutOfMemory}!BracketAccess {
-        const end_node = end_node_maybe orelse
-            return .{ .open = try analyser.resolveIntegerLiteral(u64, .of(start_node, handle)) };
+        const start_node = slice.ast.start;
+        const end_node = slice.ast.end.unwrap() orelse
+            return .{
+                .open = .{
+                    .start = try analyser.resolveIntegerLiteral(u64, .of(start_node, handle)),
+                    .sentinel = try analyser.resolveOptionalIPValue(slice.ast.sentinel, handle),
+                },
+            };
 
-        const range = blk: {
+        const bounds = blk: {
             const start = try analyser.resolveIntegerLiteral(u64, .of(start_node, handle)) orelse
                 break :blk null;
 
@@ -1116,7 +1127,12 @@ pub const BracketAccess = union(enum) {
             break :blk .{ start, end };
         };
 
-        return .{ .range = range };
+        return .{
+            .range = .{
+                .bounds = bounds,
+                .sentinel = try analyser.resolveOptionalIPValue(slice.ast.sentinel, handle),
+            },
+        };
     }
 };
 
@@ -1172,7 +1188,9 @@ pub fn resolveBracketAccessTypeFromBinding(analyser: *Analyser, lhs_binding: Bin
     const is_const = lhs_binding.is_const;
     if (lhs.is_type_val) return null;
 
-    switch (lhs.data) {
+    var result: union(enum) { array: ?u64, slice: void } = .slice;
+    var sentinel: InternPool.Index = .none;
+    const elem_ty = elem: switch (lhs.data) {
         .tuple => |fields| switch (rhs) {
             .single => |index_maybe| {
                 const index = index_maybe orelse return null;
@@ -1183,232 +1201,56 @@ pub fn resolveBracketAccessTypeFromBinding(analyser: *Analyser, lhs_binding: Bin
         },
         .array => |info| switch (rhs) {
             .single => return try info.elem_ty.instanceTypeVal(analyser),
-            .open => |start_maybe| {
-                if (start_maybe) |start| {
-                    const elem_count = blk: {
-                        const elem_count = info.elem_count orelse break :blk null;
-                        if (start > elem_count) break :blk null;
-                        break :blk elem_count - start;
-                    };
-                    return .{
-                        .data = .{
-                            .pointer = .{
-                                .size = .one,
-                                .sentinel = .none,
-                                .is_const = is_const,
-                                .elem_ty = try analyser.allocType(.{
-                                    .data = .{
-                                        .array = .{
-                                            .elem_count = elem_count,
-                                            .sentinel = info.sentinel,
-                                            .elem_ty = info.elem_ty,
-                                        },
-                                    },
-                                    .is_type_val = true,
-                                }),
-                            },
-                        },
-                        .is_type_val = false,
-                    };
+            .open => |access| {
+                if (access.start) |start| {
+                    result = .{ .array = null };
+                    if (info.elem_count) |elem_count| {
+                        if (start <= elem_count) {
+                            result = .{ .array = elem_count - start };
+                        }
+                    }
                 }
-                return .{
-                    .data = .{
-                        .pointer = .{
-                            .size = .slice,
-                            .sentinel = info.sentinel,
-                            .is_const = is_const,
-                            .elem_ty = info.elem_ty,
-                        },
-                    },
-                    .is_type_val = false,
-                };
+                sentinel = info.sentinel;
+                break :elem info.elem_ty;
             },
-            .range => |range_maybe| {
-                if (range_maybe) |range| {
-                    const start, const end = range;
-                    const elem_count = blk: {
-                        const elem_count = info.elem_count orelse break :blk null;
-                        if (start > end or start > elem_count or end > elem_count) break :blk null;
-                        break :blk end - start;
-                    };
-                    return .{
-                        .data = .{
-                            .pointer = .{
-                                .size = .one,
-                                .sentinel = .none,
-                                .is_const = is_const,
-                                .elem_ty = try analyser.allocType(.{
-                                    .data = .{
-                                        .array = .{
-                                            .elem_count = elem_count,
-                                            .sentinel = .none,
-                                            .elem_ty = info.elem_ty,
-                                        },
-                                    },
-                                    .is_type_val = true,
-                                }),
-                            },
-                        },
-                        .is_type_val = false,
-                    };
+            .range => |access| {
+                if (access.bounds) |bounds| {
+                    result = .{ .array = null };
+                    if (info.elem_count) |elem_count| {
+                        const start, const end = bounds;
+                        if (start <= end and start <= elem_count and end <= elem_count) {
+                            result = .{ .array = end - start };
+                        }
+                    }
                 }
-                return .{
-                    .data = .{
-                        .pointer = .{
-                            .size = .slice,
-                            .sentinel = .none,
-                            .is_const = is_const,
-                            .elem_ty = info.elem_ty,
-                        },
-                    },
-                    .is_type_val = false,
-                };
+                sentinel = access.sentinel orelse .none;
+                break :elem info.elem_ty;
             },
         },
         .pointer => |info| return switch (info.size) {
             .one => switch (info.elem_ty.data) {
-                .tuple => |tuple_info| {
-                    const inner_ty: Type = .{ .data = .{ .tuple = tuple_info }, .is_type_val = false };
-                    return analyser.resolveBracketAccessTypeFromBinding(.{ .type = inner_ty, .is_const = info.is_const }, rhs);
-                },
-                .array => |array_info| {
-                    const inner_ty: Type = .{ .data = .{ .array = array_info }, .is_type_val = false };
-                    return analyser.resolveBracketAccessTypeFromBinding(.{ .type = inner_ty, .is_const = info.is_const }, rhs);
-                },
+                .tuple, .array => continue :elem info.elem_ty.data,
                 else => switch (rhs) {
                     .single, .open => return null,
-                    .range => |range_maybe| {
-                        const start, const end = range_maybe orelse return null;
+                    .range => |access| {
+                        if (access.sentinel != null) return null;
+                        const start, const end = access.bounds orelse return null;
                         if (start > end or start > 1 or end > 1) return null;
-                        const elem_count = end - start;
-                        return .{
-                            .data = .{
-                                .pointer = .{
-                                    .size = .one,
-                                    .sentinel = .none,
-                                    .is_const = info.is_const,
-                                    .elem_ty = try analyser.allocType(.{
-                                        .data = .{
-                                            .array = .{
-                                                .elem_count = elem_count,
-                                                .sentinel = .none,
-                                                .elem_ty = info.elem_ty,
-                                            },
-                                        },
-                                        .is_type_val = true,
-                                    }),
-                                },
-                            },
-                            .is_type_val = false,
-                        };
+                        result = .{ .array = end - start };
+                        break :elem info.elem_ty;
                     },
                 },
             },
-            .many => switch (rhs) {
+            .many, .slice, .c => switch (rhs) {
                 .single => try info.elem_ty.instanceTypeVal(analyser),
                 .open => lhs,
-                .range => |range_maybe| {
-                    if (range_maybe) |range| {
-                        const start, const end = range;
-                        const elem_count = if (start > end) null else end - start;
-                        return .{
-                            .data = .{
-                                .pointer = .{
-                                    .size = .one,
-                                    .sentinel = .none,
-                                    .is_const = info.is_const,
-                                    .elem_ty = try analyser.allocType(.{
-                                        .data = .{
-                                            .array = .{
-                                                .elem_count = elem_count,
-                                                .sentinel = .none,
-                                                .elem_ty = info.elem_ty,
-                                            },
-                                        },
-                                        .is_type_val = true,
-                                    }),
-                                },
-                            },
-                            .is_type_val = false,
-                        };
+                .range => |access| {
+                    if (access.bounds) |bounds| {
+                        const start, const end = bounds;
+                        result = .{ .array = if (start <= end) end - start else null };
                     }
-                    return .{
-                        .data = .{
-                            .pointer = .{
-                                .size = .slice,
-                                .sentinel = .none,
-                                .is_const = info.is_const,
-                                .elem_ty = info.elem_ty,
-                            },
-                        },
-                        .is_type_val = false,
-                    };
-                },
-            },
-            .slice => switch (rhs) {
-                .single => try info.elem_ty.instanceTypeVal(analyser),
-                .open => lhs,
-                .range => |range_maybe| {
-                    const start, const end = range_maybe orelse return lhs;
-                    const elem_count = if (start > end) null else end - start;
-                    return .{
-                        .data = .{
-                            .pointer = .{
-                                .size = .one,
-                                .sentinel = .none,
-                                .is_const = info.is_const,
-                                .elem_ty = try analyser.allocType(.{
-                                    .data = .{
-                                        .array = .{
-                                            .elem_count = elem_count,
-                                            .sentinel = .none,
-                                            .elem_ty = info.elem_ty,
-                                        },
-                                    },
-                                    .is_type_val = true,
-                                }),
-                            },
-                        },
-                        .is_type_val = false,
-                    };
-                },
-            },
-            .c => switch (rhs) {
-                .single => try info.elem_ty.instanceTypeVal(analyser),
-                .open => lhs,
-                .range => |range_maybe| if (range_maybe) |range| {
-                    const start, const end = range;
-                    const elem_count = if (start > end) null else end - start;
-                    return .{
-                        .data = .{
-                            .pointer = .{
-                                .size = .one,
-                                .sentinel = .none,
-                                .is_const = info.is_const,
-                                .elem_ty = try analyser.allocType(.{
-                                    .data = .{
-                                        .array = .{
-                                            .elem_count = elem_count,
-                                            .sentinel = .none,
-                                            .elem_ty = info.elem_ty,
-                                        },
-                                    },
-                                    .is_type_val = true,
-                                }),
-                            },
-                        },
-                        .is_type_val = false,
-                    };
-                } else .{
-                    .data = .{
-                        .pointer = .{
-                            .size = .slice,
-                            .sentinel = .none,
-                            .is_const = info.is_const,
-                            .elem_ty = info.elem_ty,
-                        },
-                    },
-                    .is_type_val = false,
+                    sentinel = access.sentinel orelse .none;
+                    break :elem info.elem_ty;
                 },
             },
         },
@@ -1420,7 +1262,41 @@ pub fn resolveBracketAccessTypeFromBinding(analyser: *Analyser, lhs_binding: Bin
             return analyser.resolveBracketAccessTypeFromBinding(binding, rhs);
         },
         else => return null,
-    }
+    };
+
+    return switch (result) {
+        .array => |elem_count| .{
+            .data = .{
+                .pointer = .{
+                    .size = .one,
+                    .sentinel = .none,
+                    .is_const = is_const,
+                    .elem_ty = try analyser.allocType(.{
+                        .data = .{
+                            .array = .{
+                                .elem_count = elem_count,
+                                .sentinel = sentinel,
+                                .elem_ty = elem_ty,
+                            },
+                        },
+                        .is_type_val = true,
+                    }),
+                },
+            },
+            .is_type_val = false,
+        },
+        .slice => .{
+            .data = .{
+                .pointer = .{
+                    .size = .slice,
+                    .sentinel = sentinel,
+                    .is_const = is_const,
+                    .elem_ty = elem_ty,
+                },
+            },
+            .is_type_val = false,
+        },
+    };
 }
 
 fn resolvePropertyType(analyser: *Analyser, ty: Type, name: []const u8) error{OutOfMemory}!?Type {
@@ -1500,6 +1376,15 @@ fn allDigits(str: []const u8) bool {
         if (!std.ascii.isDigit(c)) return false;
     }
     return true;
+}
+
+fn resolveOptionalIPValue(
+    analyser: *Analyser,
+    optional_node: Ast.Node.OptionalIndex,
+    handle: *DocumentStore.Handle,
+) error{OutOfMemory}!?InternPool.Index {
+    const node = optional_node.unwrap() orelse return null;
+    return try analyser.resolveInternPoolValue(.of(node, handle));
 }
 
 fn resolveInternPoolValue(analyser: *Analyser, options: ResolveOptions) error{OutOfMemory}!?InternPool.Index {
@@ -2121,10 +2006,7 @@ fn resolveTypeOfNodeUncached(analyser: *Analyser, options: ResolveOptions) error
         => {
             const ptr_info = ast.fullPtrType(tree, node).?;
 
-            const sentinel = if (ptr_info.ast.sentinel.unwrap()) |sentinel|
-                try analyser.resolveInternPoolValue(.of(sentinel, handle)) orelse .none
-            else
-                .none;
+            const sentinel = try analyser.resolveOptionalIPValue(ptr_info.ast.sentinel, handle) orelse .none;
 
             const elem_ty = try analyser.resolveTypeOfNodeInternal(.of(ptr_info.ast.child_type, handle)) orelse return null;
             if (!elem_ty.is_type_val) return null;
@@ -2147,10 +2029,7 @@ fn resolveTypeOfNodeUncached(analyser: *Analyser, options: ResolveOptions) error
             const array_info = tree.fullArrayType(node).?;
 
             const elem_count = try analyser.resolveIntegerLiteral(u64, .of(array_info.ast.elem_count, handle));
-            const sentinel = if (array_info.ast.sentinel.unwrap()) |sentinel|
-                try analyser.resolveInternPoolValue(.of(sentinel, handle)) orelse .none
-            else
-                .none;
+            const sentinel = try analyser.resolveOptionalIPValue(array_info.ast.sentinel, handle) orelse .none;
 
             const elem_ty = try analyser.resolveTypeOfNodeInternal(.of(array_info.ast.elem_type, handle)) orelse return null;
             if (!elem_ty.is_type_val) return null;
@@ -3109,7 +2988,7 @@ fn resolveBindingOfNodeUncached(analyser: *Analyser, options: ResolveOptions) er
 
             const sliced = try analyser.resolveBindingOfNodeInternal(.of(slice.ast.sliced, handle)) orelse return null;
 
-            const kind: BracketAccess = try .fromSlice(analyser, handle, slice.ast.start, slice.ast.end.unwrap());
+            const kind: BracketAccess = try .fromSlice(analyser, handle, slice);
 
             return .{
                 .type = try analyser.resolveBracketAccessTypeFromBinding(sliced, kind) orelse return null,
@@ -4760,12 +4639,12 @@ pub fn getFieldAccessType(
                         },
                         .ellipsis2 => {
                             if (bracket_count == 1) {
-                                kind = .{ .open = null };
+                                kind = .{ .open = .{ .start = null, .sentinel = .none } };
                             }
                         },
                         else => {
                             if (bracket_count == 1 and kind == .open) {
-                                kind = .{ .range = null };
+                                kind = .{ .range = .{ .bounds = null, .sentinel = .none } };
                             }
                         },
                     }
