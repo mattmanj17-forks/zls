@@ -27,20 +27,18 @@ When upgrading Zig, make sure to update ZLS too keep them in sync.
 
 ZLS supports most language features, including simple type function support, payload capture type resolution, custom packages, and others. Support for comptime and semantic analysis is Work-in-Progress.
 
-The following LSP features are supported:
+The majority of LSP features are supported:
 
 - Completions
 - Hover
-- Goto definition/declaration
-- Document symbols
-- Find references
-- Rename symbol
-- Formatting using `zig fmt`
-- Semantic token highlighting
+- Diagnostics and opt-in [build-on-save](https://zigtools.org/zls/guides/build-on-save/)
+- Go to definition/declaration
+- Workspace symbols and document symbols
+- Find references and rename symbol
+- Formatting based on `zig fmt`
+- Semantic tokens highlighting
 - Inlay hints
 - Code actions
-- Selection ranges
-- Folding regions
 
 ## Related Projects
 
