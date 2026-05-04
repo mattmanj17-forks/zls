@@ -40,18 +40,6 @@ The majority of LSP features are supported:
 - Inlay hints
 - Code actions
 
-## Related Projects
-
-- [`sublime-zig-language` by @prime31](https://github.com/prime31/sublime-zig-language)
-  - Supports basic language features
-  - Uses data provided by `src/data` to perform builtin autocompletion
-- [`zig-lsp` by @xackus](https://github.com/xackus/zig-lsp)
-  - Inspiration for ZLS
-- [`known-folders` by @ziglibs](https://github.com/ziglibs/known-folders)
-  - Provides API to access known folders on Linux, Windows and Mac OS
-- [`zls` by @zigtools](https://github.com/zigtools/zls)
-  - Used by many ZLS developers to more efficiently work on ZLS
-
 ## Quick Thanks :)
 
 We'd like to take a second to thank all our awesome [contributors](https://github.com/zigtools/zls/graphs/contributors) and donators/backers/sponsors; if you have time or money to spare, consider partaking in either of these options - they help keep ZLS awesome for everyone!
