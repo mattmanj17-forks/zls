@@ -298,7 +298,7 @@ pub fn build(b: *Build) !void {
             const argv = run_step.argv.toOwnedSlice(b.allocator) catch @panic("OOM");
             run_step.addFileArg(kcov_bin);
             run_step.addArg("--collect-only");
-            run_step.addDirectoryArg2(b.path("src"), .{ .prefix = "--include-pattern=" });
+            run_step.addDirectoryArg2(b.path("src"), .{ .prefix = "--include-pattern=", .make_absolute = true });
             merge_step.addDirectoryArg(run_step.addOutputFileArg2(run_step.producer.?.name, .{}));
             run_step.argv.appendSlice(b.allocator, argv) catch @panic("OOM");
         }
